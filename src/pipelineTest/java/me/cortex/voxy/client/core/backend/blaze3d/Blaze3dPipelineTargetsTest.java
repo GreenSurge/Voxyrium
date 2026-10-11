@@ -25,7 +25,7 @@ import java.util.Set;
 /** Exercises Minecraft's actual attachment validation without opening a device or the game. */
 public final class Blaze3dPipelineTargetsTest {
     private static int accepted;
-    public static void main(String[] args) {
+    public static void main(String[] args) throws ReflectiveOperationException {
         verify(Blaze3dAuxiliaryPipelines.SODIUM_DEPTH, GpuFormat.RGBA8_UNORM);
         var variants = Blaze3dAuxiliaryPipelines.SODIUM_DEPTH_VARIANTS;
         verify(variants.sampleMask(), GpuFormat.RGBA8_UNORM);
@@ -40,6 +40,20 @@ public final class Blaze3dPipelineTargetsTest {
         verify(Blaze3dAuxiliaryPipelines.HIZ_REDUCE, GpuFormat.R32_FLOAT);
         verify(Blaze3dAuxiliaryPipelines.HIZ_VISIBILITY, GpuFormat.R8_UNORM);
         verify(Blaze3dAuxiliaryPipelines.HIZ_COMMANDS, GpuFormat.RGBA32_UINT);
+        // 26.3 no longer creates a default colour attachment. Check every production pass.
+        for (String name : List.of("MARKER_PIPELINE", "LOD_PIPELINE", "LOD_WATER_PIPELINE",
+                "LOD_OVERLAY_PIPELINE", "LOD_WATER_OVERLAY_PIPELINE", "LOD_COMPOSITE_PIPELINE",
+                "LOD_TRANSLUCENT_COMPOSITE_PIPELINE", "GLOBAL_FOG_PIPELINE")) {
+            var field = VoxyBlaze3DProbeRenderer.class.getDeclaredField(name);
+            field.setAccessible(true);
+            Object value = field.get(null);
+            if (value instanceof Blaze3dDiscardPipelines pair) {
+                verify(pair.normal(), GpuFormat.RGBA8_UNORM);
+                verify(pair.sampleMask(), GpuFormat.RGBA8_UNORM);
+            } else {
+                verify((RenderPipeline) value, GpuFormat.RGBA8_UNORM);
+            }
+        }
         if (Blaze3dAuxiliaryPipelines.SODIUM_DEPTH.getColorTargetStates().getFirst().writeMask() != ColorTargetState.WRITE_NONE
                 || !Blaze3dAuxiliaryPipelines.SODIUM_DEPTH.wantsDepthTexture()) {
             throw new AssertionError("Depth prefill must write depth without writing colour");
@@ -70,8 +84,19 @@ public final class Blaze3dPipelineTargetsTest {
         } catch (IllegalStateException expected) {
             if (!expected.getMessage().contains("format doesn't match")) throw expected;
         }
-        if (accepted != 6) throw new AssertionError("Invalid pipelines must fail before backend submission");
-        System.out.println("Blaze3D pipeline targets: six actual variants accepted; independent discard shaders, logged failure and wrong integer target checked without a GPU.");
+        var missingTarget = RenderPipeline.builder().withLocation(Identifier.fromNamespaceAndPath("voxy", "missing_colour_target"))
+                .withVertexShader(Identifier.fromNamespaceAndPath("voxy", "core/blaze3d_lod_composite"))
+                .withFragmentShader(Identifier.fromNamespaceAndPath("voxy", "core/blaze3d_lod_composite"))
+                .withVertexBinding(0, DefaultVertexFormat.POSITION)
+                .withPrimitiveTopology(PrimitiveTopology.TRIANGLE_STRIP).build();
+        try {
+            verify(missingTarget, GpuFormat.RGBA8_UNORM);
+            throw new AssertionError("Missing colour target was accepted");
+        } catch (IllegalStateException expected) {
+            if (!expected.getMessage().contains("attachment count")) throw expected;
+        }
+        if (accepted != 21) throw new AssertionError("Invalid pipelines must fail before backend submission");
+        System.out.println("Blaze3D pipeline targets: 21 actual variants accepted; missing colour attachment, wrong format and discard variants checked without a GPU.");
     }
 
     private static void verify(RenderPipeline pipeline, GpuFormat format) {

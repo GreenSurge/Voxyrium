@@ -208,6 +208,7 @@ public final class VoxyBlaze3DProbeRenderer {
                 .withFragmentShader("core/position_tex_color")
                 .withVertexBinding(0, DefaultVertexFormat.POSITION_TEX_COLOR)
                 .withPrimitiveTopology(PrimitiveTopology.TRIANGLES)
+                .withColorTargetState(ColorTargetState.DEFAULT)
                 .withDepthStencilState(new DepthStencilState(CompareOp.GREATER_THAN, false))
                 .withCull(true)
                 .build();
@@ -226,6 +227,7 @@ public final class VoxyBlaze3DProbeRenderer {
             .withVertexBinding(0, LOD_CORNER_FORMAT)
             .withVertexBinding(1, LOD_INSTANCE_FORMAT)
             .withPrimitiveTopology(PrimitiveTopology.TRIANGLES)
+            .withColorTargetState(ColorTargetState.DEFAULT)
             .withDepthStencilState(new DepthStencilState(depthTest, writeDepth))
             .withCull(false);
         if (translucent) {
@@ -244,6 +246,7 @@ public final class VoxyBlaze3DProbeRenderer {
                 .withFragmentShader(Identifier.fromNamespaceAndPath("voxy", "core/blaze3d_lod_composite"))
                 .withVertexBinding(0, DefaultVertexFormat.POSITION)
                 .withPrimitiveTopology(PrimitiveTopology.TRIANGLE_STRIP)
+                .withColorTargetState(ColorTargetState.DEFAULT)
                 .withDepthStencilState(new DepthStencilState(CompareOp.GREATER_THAN, writeDepth))
                 .withCull(false);
         if (translucent) {
