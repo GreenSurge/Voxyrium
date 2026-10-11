@@ -93,8 +93,6 @@ public abstract class MixinDefaultChunkRenderer extends ShaderChunkRenderer {
                 && !IrisUtil.irisShadowActive()) {
             var target = renderPass.getTarget();
             VoxyBlaze3DProbeRenderer.renderWater(matrices, target.getColorTextureView(), target.getDepthTextureView(), camera, fogParameters);
-            VoxyBlaze3DProbeRenderer.renderGlobalFog(
-                    matrices, target.getColorTextureView(), target.getDepthTextureView(), fogParameters);
         }
     }
 }

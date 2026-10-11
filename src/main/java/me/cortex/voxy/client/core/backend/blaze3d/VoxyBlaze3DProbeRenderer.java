@@ -195,7 +195,6 @@ public final class VoxyBlaze3DProbeRenderer {
             "blaze3d_lod_composite", true, false);
     private static final Blaze3dDiscardPipelines LOD_TRANSLUCENT_COMPOSITE_PIPELINE = createCompositePipeline(
             "blaze3d_lod_translucent_composite", false, true);
-    private static final Blaze3dDiscardPipelines GLOBAL_FOG_PIPELINE = createGlobalFogPipeline();
     private static final Blaze3dDiscardPipelines LOD_DEPTH_SEED_PIPELINE = Blaze3dAuxiliaryPipelines.SODIUM_DEPTH_VARIANTS;
 
     private static RenderPipeline createTexturedMarkerPipeline() {
@@ -249,25 +248,10 @@ public final class VoxyBlaze3DProbeRenderer {
         return Blaze3dDiscardPipelines.build(builder);
     }
 
-    private static Blaze3dDiscardPipelines createGlobalFogPipeline() {
-        return Blaze3dDiscardPipelines.build(RenderPipeline.builder()
-                .withLocation(Identifier.fromNamespaceAndPath("voxy", "blaze3d_global_fog"))
-                .withBindGroupLayout(BindGroupLayouts.MATRICES_PROJECTION)
-                .withBindGroupLayout(BindGroupLayouts.FOG)
-                .withBindGroupLayout(BindGroupLayouts.SAMPLER0_SAMPLER1)
-                .withVertexShader(Identifier.fromNamespaceAndPath("voxy", "core/blaze3d_global_fog"))
-                .withFragmentShader(Identifier.fromNamespaceAndPath("voxy", "core/blaze3d_global_fog"))
-                .withVertexBinding(0, DefaultVertexFormat.POSITION)
-                .withPrimitiveTopology(PrimitiveTopology.TRIANGLE_STRIP)
-                .withColorTargetState(new ColorTargetState(BlendFunction.TRANSLUCENT))
-                .withCull(false));
-    }
-
     private static GpuBuffer markerVertexBuffer;
     private static GpuBuffer lodIndexBuffer;
     private static GpuBuffer lodCornerBuffer;
     private static GpuBuffer lodProjectionBuffer;
-    private static GpuBuffer globalFogProjectionBuffer;
     private static GpuBuffer compositeVertexBuffer;
     private static GpuTexture lodColorTexture;
     private static GpuTextureView lodColorTextureView;
@@ -372,8 +356,8 @@ public final class VoxyBlaze3DProbeRenderer {
     private static float sourceFogEnd;
     private static float capturedVanillaFogStart = Float.NaN;
     private static float capturedVanillaFogEnd = Float.NaN;
-    private static float activeFogStart;
-    private static float activeFogEnd;
+    private static float lodFogStart;
+    private static float lodFogEnd;
     private static boolean activeDenseFog;
     private static VanillaBoundaryKey lastVanillaBoundaryKey;
     private static int loggedMaterialDefinitions;
@@ -714,9 +698,8 @@ public final class VoxyBlaze3DProbeRenderer {
                 + ".." + Math.max(1, sodiumRenderDistanceChunks) * 16 + " blocks]"
                 + ", vanillaFog=" + Math.round(sourceFogStart) + ".." + Math.round(sourceFogEnd)
                 + (VoxyConfig.CONFIG.getFogMode().hasFog
-                ? ", globalFog=" + Math.round(sourceFogStart) + ".."
-                + Math.round(getTerrainFogEndBlocks(sourceFogStart))
-                : ", globalFog=off")
+                ? ", voxyFog=" + Math.round(lodFogStart) + ".." + Math.round(lodFogEnd)
+                : ", voxyFog=off")
                 + (activeDenseFog ? ", environmentalFog=dense" : "")
                 + ", depthComposition=offscreen-reproject"
                 + ", vanillaMaskRevision=" + visibleVanillaMaskRevision
@@ -927,74 +910,6 @@ public final class VoxyBlaze3DProbeRenderer {
         }
     }
 
-    /**
-     * Applies render-distance fog once after Sodium and Voxy have populated the shared target.
-     * Environmental fog remains on the geometry and is accounted for by the fullscreen shader,
-     * so overlapping fog modes still match Sodium's max(environmental, render-distance) rule.
-     */
-    public static void renderGlobalFog(ChunkRenderMatrices matrices, GpuTextureView colorTarget,
-                                       GpuTextureView depthTarget, FogParameters fogParameters) {
-        if (failed || IrisUtil.irisShadowActive() || !VoxyConfig.CONFIG.getFogMode().hasFog) {
-            return;
-        }
-
-        long fogStart = profileNow();
-        try {
-            RenderSystem.assertOnRenderThread();
-            initialize();
-            if (lodOpaqueDepthTextureView == null || lodOpaqueDepthTextureView.isClosed()) {
-                return;
-            }
-
-            updateFogRange(fogParameters);
-            float renderFogStart = sourceFogStart;
-            float renderFogEnd = getTerrainFogEndBlocks(renderFogStart);
-            if (!Float.isFinite(renderFogStart) || renderFogEnd <= renderFogStart) {
-                return;
-            }
-
-            Matrix4f inverseViewRotation = new Matrix4f(matrices.modelView()).invert();
-            Matrix4f lodReconstruction = new Matrix4f(inverseViewRotation)
-                    .mul(createLodProjection(matrices.projection()).invert());
-            Matrix4f minecraftReconstruction = new Matrix4f(inverseViewRotation)
-                    .mul(new Matrix4f(matrices.projection()).invert());
-            Matrix4f minecraftViewProjection = new Matrix4f(matrices.projection())
-                    .mul(matrices.modelView());
-            boolean zeroToOne = RenderSystem.getDevice().getDeviceInfo().isZZeroToOne();
-
-            CommandEncoder encoder = RenderSystem.getDevice().createCommandEncoder();
-            gpuProfiler.begin(encoder, Blaze3dGpuProfiler.Stage.FOG);
-            uploadGlobalFogProjection(encoder, minecraftReconstruction);
-            try (RenderPass pass = encoder.createRenderPass(
-                    () -> "Voxy Blaze3D global terrain fog",
-                    colorTarget,
-                    Optional.empty())) {
-                RenderSystem.bindDefaultUniforms(pass);
-                pass.setUniform("DynamicTransforms", RenderSystem.getDynamicUniforms().writeTransform(
-                        lodReconstruction,
-                        new Vector4f(1.0f),
-                        new Vector3f(zeroToOne ? 1.0f : 0.0f, renderFogStart, renderFogEnd),
-                        minecraftViewProjection));
-                pass.setUniform("Projection", globalFogProjectionBuffer.slice());
-                pass.setUniform("Fog", RenderSystem.getShaderFog());
-                pass.setPipeline(GLOBAL_FOG_PIPELINE.get());
-                pass.bindTexture("Sampler0", depthTarget,
-                        RenderSystem.getSamplerCache().getClampToEdge(FilterMode.NEAREST));
-                pass.bindTexture("Sampler1", lodOpaqueDepthTextureView,
-                        RenderSystem.getSamplerCache().getClampToEdge(FilterMode.NEAREST));
-                pass.setVertexBuffer(0, compositeVertexBuffer.slice());
-                pass.draw(COMPOSITE_VERTEX_COUNT, 1, 0, 0);
-            }
-            gpuProfiler.end(encoder, Blaze3dGpuProfiler.Stage.FOG);
-        } catch (RuntimeException exception) {
-            failed = true;
-            benchmarkEvent("ERROR", "fog frame=" + frameCount + " exception=" + exception);
-            Logger.error("Blaze3D global terrain fog pass failed; restoring Minecraft fog next frame.", exception);
-        } finally {
-            benchmarkStage(Blaze3dBenchmark.Stage.FOG, fogStart);
-        }
-    }
-
     private static void preparePass(RenderPass pass, ChunkRenderMatrices matrices, CameraTransform camera,
                                     FogParameters fogParameters, boolean applyLodParameters) {
         RenderSystem.bindDefaultUniforms(pass);
@@ -1003,8 +918,11 @@ public final class VoxyBlaze3DProbeRenderer {
                 .translate((float) -camera.x, (float) -camera.y, (float) -camera.z);
         if (applyLodParameters) {
             updateFogRange(fogParameters);
+            float fogStart = VoxyConfig.CONFIG.getFogMode().hasFog ? lodFogStart : 0.0f;
+            float fogEnd = VoxyConfig.CONFIG.getFogMode().hasFog ? lodFogEnd : 0.0f;
             pass.setUniform("DynamicTransforms", RenderSystem.getDynamicUniforms().writeTransform(
-                    cameraRelativeModelView));
+                    cameraRelativeModelView, new Vector4f(1.0f), new Vector3f(0.0f, fogStart, fogEnd),
+                    new Matrix4f()));
         } else {
             pass.setUniform("DynamicTransforms", RenderSystem.getDynamicUniforms().writeTransform(cameraRelativeModelView));
         }
@@ -1120,8 +1038,8 @@ public final class VoxyBlaze3DProbeRenderer {
     private static void updateFogRange(FogParameters fogParameters) {
         sourceFogStart = 0.0f;
         sourceFogEnd = 0.0f;
-        activeFogStart = 0.0f;
-        activeFogEnd = 0.0f;
+        lodFogStart = 0.0f;
+        lodFogEnd = 0.0f;
         activeDenseFog = false;
         if (fogParameters == null) {
             return;
@@ -1145,14 +1063,13 @@ public final class VoxyBlaze3DProbeRenderer {
                 && environmentalEnd > environmentalStart
                 && (!Float.isFinite(renderEnd) || environmentalEnd < Math.min(renderEnd * 0.25f, 128.0f));
         if (activeDenseFog) {
-            activeFogStart = environmentalStart;
-            activeFogEnd = environmentalEnd;
+            lodFogStart = environmentalStart;
+            lodFogEnd = environmentalEnd;
         } else {
-            // MixinFogRenderer gives Sodium this same extended range before it snapshots FogData.
-            // Keeping the vanilla start and only moving the end to Voxy's horizon produces one
-            // continuous terrain ramp across both renderers.
-            activeFogStart = renderStart;
-            activeFogEnd = getTerrainFogEndBlocks(activeFogStart);
+            // Match the 1.21.11 compositor: apply the terrain ramp to Voxy geometry only.
+            // Minecraft/Sodium keep their own fog, while the sky and clouds stay untouched.
+            lodFogStart = renderStart;
+            lodFogEnd = getTerrainFogEndBlocks(lodFogStart);
         }
     }
 
@@ -1172,7 +1089,7 @@ public final class VoxyBlaze3DProbeRenderer {
         return Math.max(fogStart + 1.0f, getVoxyRenderDistanceBlocks());
     }
 
-    public static boolean canApplyGlobalFog() {
+    public static boolean canApplyTerrainFog() {
         return !failed;
     }
 
@@ -1234,25 +1151,6 @@ public final class VoxyBlaze3DProbeRenderer {
                         data);
             } else {
                 encoder.writeToBuffer(lodProjectionBuffer.slice(), data);
-            }
-        } finally {
-            MemoryUtil.memFree(data);
-        }
-    }
-
-    private static void uploadGlobalFogProjection(CommandEncoder encoder, Matrix4fc reconstruction) {
-        ByteBuffer data = MemoryUtil.memAlloc(PROJECTION_UNIFORM_BYTES);
-        try {
-            reconstruction.get(data);
-            data.position(0);
-            data.limit(PROJECTION_UNIFORM_BYTES);
-            if (globalFogProjectionBuffer == null || globalFogProjectionBuffer.isClosed()) {
-                globalFogProjectionBuffer = RenderSystem.getDevice().createBuffer(
-                        () -> "Voxy Blaze3D Minecraft depth reconstruction",
-                        GpuBuffer.USAGE_UNIFORM | GpuBuffer.USAGE_COPY_DST,
-                        data);
-            } else {
-                encoder.writeToBuffer(globalFogProjectionBuffer.slice(), data);
             }
         } finally {
             MemoryUtil.memFree(data);
@@ -1464,8 +1362,6 @@ public final class VoxyBlaze3DProbeRenderer {
         lastOccluderMeshes = 0;
         lodOcclusionEnabled = false;
         sodiumColumns = Blaze3dSodiumCoverage.empty();
-        releaseBuffer(globalFogProjectionBuffer, "global fog projection");
-        globalFogProjectionBuffer = null;
         releaseOffscreenTargets();
         if (sodiumCoverageDepthTextureView != null) sodiumCoverageDepthTextureView.close();
         if (sodiumCoverageDepthTexture != null) sodiumCoverageDepthTexture.close();
@@ -1517,8 +1413,8 @@ public final class VoxyBlaze3DProbeRenderer {
         lastLodSelectionViewportHeight = -1;
         lastLodSelectionViewProjection = null;
         activeVanillaBoundary = null;
-        activeFogStart = 0.0f;
-        activeFogEnd = 0.0f;
+        lodFogStart = 0.0f;
+        lodFogEnd = 0.0f;
         activeDenseFog = false;
         capturedVanillaFogStart = Float.NaN;
         capturedVanillaFogEnd = Float.NaN;

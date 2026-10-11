@@ -84,10 +84,12 @@ void main() {
         color *= tintColor;
     }
     color *= vertexLighting;
-    // Render-distance fog is deliberately disabled for both Sodium and Voxy and applied once
-    // from their combined depth. Environmental fog stays per geometry, matching Sodium.
-    float fogValue = linearFogValue(
+    // Match the 1.21.11 compositor: fog Voxy LoDs only, leaving the shared Minecraft scene intact.
+    float environmentalFog = linearFogValue(
             sphericalDistance, FogEnvironmentalStart, FogEnvironmentalEnd);
+    float renderDistanceFog = ModelOffset.z > ModelOffset.y
+            ? linearFogValue(sphericalDistance, ModelOffset.y, ModelOffset.z) : 0.0;
+    float fogValue = max(environmentalFog, renderDistanceFog);
     color.rgb = mix(color.rgb, FogColor.rgb, fogValue * FogColor.a);
     fragColor = color * ColorModulator;
 }

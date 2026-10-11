@@ -1,6 +1,8 @@
 package me.cortex.voxy.client.mixin.minecraft;
 
 import me.cortex.voxy.client.config.VoxyConfig;
+import me.cortex.voxy.client.core.FogRangePolicy;
+import me.cortex.voxy.client.core.IVoxyRenderSystemHolder;
 import me.cortex.voxy.client.core.backend.blaze3d.VoxyBlaze3DProbeRenderer;
 import me.cortex.voxy.common.Logger;
 import net.minecraft.client.Camera;
@@ -19,18 +21,18 @@ import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 @Mixin(value = FogRenderer.class, priority = 900)
 public class MixinFogRenderer {
     @Unique
-    private static final float voxy$disabledFogDistance = 999999999.0F;
-
-    @Unique
     private static boolean voxy$loggedBlaze3dFogReplacement;
 
     @Unique
-    private static boolean voxy$loggedMinecraftFogSuppression;
+    private static boolean voxy$loggedRenderFogReplacement;
 
     @Inject(method = "setupFog", at = @At("RETURN"))
     private void voxy$modifyFog(Camera camera, int renderDistanceInChunks, DeltaTracker deltaTracker, float darkenWorldAmount, ClientLevel level, CallbackInfoReturnable<FogData> cir) {
         boolean blaze3dProbeActive = VoxyConfig.CONFIG.isBlaze3dRenderingEnabled()
-                && VoxyBlaze3DProbeRenderer.canApplyGlobalFog();
+                && VoxyBlaze3DProbeRenderer.canApplyTerrainFog();
+        boolean nativeRendererActive = VoxyConfig.CONFIG.isRenderingEnabled()
+                && IVoxyRenderSystemHolder.getNullable() != null;
+        if (!blaze3dProbeActive && !nativeRendererActive) return;
 
         var data = cir.getReturnValue();
         if (blaze3dProbeActive) {
@@ -40,24 +42,24 @@ public class MixinFogRenderer {
                     data.renderDistanceStart, data.renderDistanceEnd);
             if (!voxy$loggedBlaze3dFogReplacement) {
                 voxy$loggedBlaze3dFogReplacement = true;
-                Logger.info("Blaze3D renderer replacing per-geometry render fog with one depth-based world pass: environmental="
+                Logger.info("Blaze3D renderer extending terrain fog on Voxy LoDs only: environmental="
                         + data.environmentalStart + ".." + data.environmentalEnd
                         + ", render-distance=" + data.renderDistanceStart + ".." + data.renderDistanceEnd);
             }
         }
 
-        if (!voxy$loggedMinecraftFogSuppression) {
-            voxy$loggedMinecraftFogSuppression = true;
-            Logger.info("Minecraft/Sodium fog disabled globally; fog settings now affect only Voxy.");
+        if (!voxy$loggedRenderFogReplacement) {
+            voxy$loggedRenderFogReplacement = true;
+            Logger.info("Voxy replacing terrain distance fog; preserving Minecraft sky and cloud fog.");
         }
 
-        // Minecraft and Sodium must never bake fog into their geometry. Voxy owns any optional
-        // fog pass independently, so changing Voxy's fog settings cannot re-enable vanilla fog.
-        data.environmentalStart = voxy$disabledFogDistance;
-        data.environmentalEnd = voxy$disabledFogDistance;
-        data.renderDistanceStart = voxy$disabledFogDistance;
-        data.renderDistanceEnd = voxy$disabledFogDistance;
-        data.skyEnd = voxy$disabledFogDistance;
-        data.cloudEnd = voxy$disabledFogDistance;
+        var ranges = FogRangePolicy.forVoxy(new FogRangePolicy.Range(
+                data.environmentalStart, data.environmentalEnd, data.renderDistanceStart,
+                data.renderDistanceEnd, data.skyEnd, data.cloudEnd), true,
+                VoxyConfig.CONFIG.getFogMode().removesVanillaEnvFog);
+        data.environmentalStart = ranges.environmentalStart();
+        data.environmentalEnd = ranges.environmentalEnd();
+        data.renderDistanceStart = ranges.renderStart();
+        data.renderDistanceEnd = ranges.renderEnd();
     }
 }
