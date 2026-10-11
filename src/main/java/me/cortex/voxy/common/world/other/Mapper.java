@@ -388,7 +388,8 @@ public class Mapper {
                 if (compound.getIntOr("id", -1) != id) {
                     throw new IllegalStateException("Encoded id != expected id");
                 }
-                var bsc = compound.getCompound("block_state").orElseThrow();
+
+                var bsc = compound.get("block_state");
                 var state = BlockState.CODEC.parse(NbtOps.INSTANCE, bsc);
                 if (state.isError()) {
                     Logger.info("Could not decode blockstate, attempting fixes, error: "+ state.error().get().message());
