@@ -1,6 +1,7 @@
 #version 330
-#moj_import <voxy:blaze3d_fragment_discard.glsl>
-#moj_import <voxy:blaze3d_sodium_coverage.glsl>
+#extension GL_ARB_separate_shader_objects : require
+#include <voxy:blaze3d_fragment_discard.glsl>
+#include <voxy:blaze3d_sodium_coverage.glsl>
 
 layout(std140) uniform DynamicTransforms {
     mat4 ModelViewMat;
@@ -20,15 +21,15 @@ layout(std140) uniform Fog {
 
 uniform sampler2D Sampler0;
 
-in vec2 texCoord0;
-flat in vec4 tintColor;
-flat in vec4 vertexLighting;
-flat in int modelId;
-flat in int quadFlags;
-in float sphericalDistance;
-in vec2 worldXZ;
+layout(location = 0) in vec2 texCoord0;
+layout(location = 1) flat in vec4 tintColor;
+layout(location = 2) flat in vec4 vertexLighting;
+layout(location = 3) flat in int modelId;
+layout(location = 4) flat in int quadFlags;
+layout(location = 5) in float sphericalDistance;
+layout(location = 6) in vec2 worldXZ;
 
-out vec4 fragColor;
+layout(location = 0) out vec4 fragColor;
 
 float linearFogValue(float fogDistance, float start, float end) {
     if (fogDistance <= start) {

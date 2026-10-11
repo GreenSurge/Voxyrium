@@ -1,4 +1,5 @@
 #version 330
+#extension GL_ARB_separate_shader_objects : require
 layout(std140) uniform DynamicTransforms {
     mat4 ModelViewMat; // Complete world-to-clip matrix, including camera translation.
     vec4 ColorModulator;
@@ -8,8 +9,8 @@ layout(std140) uniform DynamicTransforms {
 uniform sampler2D Sampler0;
 uniform samplerBuffer VoxyOcclusionOrigins;
 uniform usamplerBuffer VoxyOcclusionBounds;
-in vec2 texCoord;
-out vec4 fragColor;
+layout(location = 0) in vec2 texCoord;
+layout(location = 0) out vec4 fragColor;
 
 bool visible(vec4 origin, uint bounds) {
     vec3 minimum = vec3(bounds & 31u, (bounds >> 5u) & 31u, (bounds >> 10u) & 31u);

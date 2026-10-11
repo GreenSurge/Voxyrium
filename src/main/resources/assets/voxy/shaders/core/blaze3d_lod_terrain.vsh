@@ -1,5 +1,6 @@
 #version 330
-#moj_import <voxy:blaze3d_sodium_coverage.glsl>
+#extension GL_ARB_separate_shader_objects : require
+#include <voxy:blaze3d_sodium_coverage.glsl>
 
 layout(std140) uniform DynamicTransforms {
     mat4 ModelViewMat;
@@ -12,8 +13,8 @@ layout(std140) uniform Projection {
 };
 
 // Only the original Cortex quad advances per instance; metadata is shared on the GPU.
-in vec2 Corner;
-in uvec2 QuadData;
+layout(location = 0) in vec2 Corner;
+layout(location = 1) in uvec2 QuadData;
 layout(std140) uniform VoxySection {
     vec4 SectionOriginScale;
 };
@@ -29,13 +30,13 @@ uniform sampler2D VoxyVisibility;
 
 uniform sampler2D Sampler2;
 
-out vec2 texCoord0;
-flat out vec4 tintColor;
-flat out vec4 vertexLighting;
-flat out int modelId;
-flat out int quadFlags;
-out float sphericalDistance;
-out vec2 worldXZ;
+layout(location = 0) out vec2 texCoord0;
+layout(location = 1) flat out vec4 tintColor;
+layout(location = 2) flat out vec4 vertexLighting;
+layout(location = 3) flat out int modelId;
+layout(location = 4) flat out int quadFlags;
+layout(location = 5) out float sphericalDistance;
+layout(location = 6) out vec2 worldXZ;
 
 float fluidHeightOffset(int face, int axis, ivec2 corner, uint heights) {
     int index = -1;

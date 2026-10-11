@@ -1,5 +1,6 @@
 #version 330
-#moj_import <voxy:blaze3d_fragment_discard.glsl>
+#extension GL_ARB_separate_shader_objects : require
+#include <voxy:blaze3d_fragment_discard.glsl>
 
 layout(std140) uniform DynamicTransforms {
     // Reconstructs camera-relative world position from Voxy's extended depth.
@@ -27,9 +28,9 @@ layout(std140) uniform Fog {
 uniform sampler2D Sampler0;
 uniform sampler2D Sampler1;
 
-in vec2 texCoord;
+layout(location = 0) in vec2 texCoord;
 
-out vec4 fragColor;
+layout(location = 0) out vec4 fragColor;
 
 const float DEPTH_UNIT = 1.0 / 16777215.0;
 

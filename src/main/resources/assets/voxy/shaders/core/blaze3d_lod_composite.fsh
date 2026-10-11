@@ -1,5 +1,6 @@
 #version 330
-#moj_import <voxy:blaze3d_fragment_discard.glsl>
+#extension GL_ARB_separate_shader_objects : require
+#include <voxy:blaze3d_fragment_discard.glsl>
 
 layout(std140) uniform DynamicTransforms {
     // The Java side stores the inverse Voxy projection here for reconstruction.
@@ -18,9 +19,9 @@ uniform sampler2D Sampler1;
 // Snapshot of Sodium's solid/cutout depth, taken before Voxy composites into the target.
 uniform sampler2D Sampler2;
 
-in vec2 texCoord;
+layout(location = 0) in vec2 texCoord;
 
-out vec4 fragColor;
+layout(location = 0) out vec4 fragColor;
 
 void main() {
     VOXY_INIT_FRAGMENT();

@@ -1,8 +1,9 @@
 #version 330
+#extension GL_ARB_separate_shader_objects : require
 uniform sampler2D Sampler0;
 uniform usamplerBuffer VoxyOcclusionCounts;
-in vec2 texCoord;
-out uvec4 fragColor;
+layout(location = 0) in vec2 texCoord;
+layout(location = 0) out uvec4 fragColor;
 void main() {
     ivec2 pixel = ivec2(gl_FragCoord.xy);
     ivec2 slot = ivec2(pixel.x / 3, pixel.y);

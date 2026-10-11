@@ -14,6 +14,8 @@ import struct
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--library", required=True, type=Path)
+    parser.add_argument("--require-explicit-locations", action="store_true",
+                        help="Match Minecraft 26.3: reject undeclared shader input/output locations.")
     args = parser.parse_args()
     library = ctypes.CDLL(str(args.library.resolve()))
     pointer = ctypes.c_void_p
@@ -39,13 +41,13 @@ def main():
     root = Path(__file__).resolve().parents[1] / "src/main/resources/assets/voxy/shaders"
 
     def expand(path):
-        return re.sub(r"#moj_import <voxy:([^>]+)>",
+        return re.sub(r"#(?:moj_import|include) <voxy:([^>]+)>",
                       lambda match: expand(root / "include" / match.group(1)), path.read_text())
 
     checked = 0
     try:
         function("compile_options_set_auto_bind_uniforms", None, [pointer, ctypes.c_bool])(options, True)
-        function("compile_options_set_auto_map_locations", None, [pointer, ctypes.c_bool])(options, True)
+        function("compile_options_set_auto_map_locations", None, [pointer, ctypes.c_bool])(options, not args.require_explicit_locations)
         shaders = sorted(list((root / "core").glob("blaze3d_*.vsh"))
                          + list((root / "core").glob("blaze3d_*.fsh")))
         for environment, version, label in [(0, 4202496, "Vulkan 1.2"), (1, 450, "OpenGL 4.5")]:
