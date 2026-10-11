@@ -1,4 +1,5 @@
 #version 330
+#moj_import <voxy:blaze3d_fragment_discard.glsl>
 
 layout(std140) uniform DynamicTransforms {
     // The Java side stores the inverse Voxy projection here for reconstruction.
@@ -22,9 +23,13 @@ in vec2 texCoord;
 out vec4 fragColor;
 
 void main() {
+    VOXY_INIT_FRAGMENT();
+    // The depth target is prefilled from Sodium, but only Voxy colour belongs in this composite.
+    vec4 lodColor = texture(Sampler0, texCoord);
+    if (lodColor.a <= 0.0) VOXY_DISCARD_FRAGMENT();
     float lodDepth = texture(Sampler1, texCoord).r;
     if (lodDepth <= 0.0) {
-        discard;
+        VOXY_DISCARD_FRAGMENT();
     }
 
     float lodNdcDepth = ModelOffset.x > 0.5 ? lodDepth : lodDepth * 2.0 - 1.0;
@@ -49,7 +54,7 @@ void main() {
     float fragmentDistance = sqrt(max(0.0, dot(viewPosition.xyz, viewPosition.xyz)
             - verticalDistance * verticalDistance));
     if (sodiumCoversSurface && fragmentDistance < ModelOffset.y) {
-        discard;
+        VOXY_DISCARD_FRAGMENT();
     }
     if (sodiumCoversSurface && ModelOffset.z > ModelOffset.y && fragmentDistance < ModelOffset.z) {
         // Stable 4x4 Bayer ordered dithering. Voxy gains coverage gradually in the final
@@ -61,7 +66,7 @@ void main() {
         float threshold = (float(bayer) + 0.5) / 16.0;
         float coverage = smoothstep(ModelOffset.y, ModelOffset.z, fragmentDistance);
         if (coverage <= threshold) {
-            discard;
+            VOXY_DISCARD_FRAGMENT();
         }
     }
 
@@ -74,5 +79,5 @@ void main() {
     // win deterministically instead of alternating because of reconstruction/rounding noise.
     float sodiumBiasedDepth = max(0.0, minecraftDepth - 4.0 / 16777215.0);
     gl_FragDepth = minecraftDepth > 0.0 ? max(sodiumBiasedDepth, distantDepth) : distantDepth;
-    fragColor = texture(Sampler0, texCoord) * ColorModulator.w;
+    fragColor = lodColor * ColorModulator.w;
 }

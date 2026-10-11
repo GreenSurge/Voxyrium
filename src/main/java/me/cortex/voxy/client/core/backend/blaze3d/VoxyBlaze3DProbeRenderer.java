@@ -4,10 +4,13 @@ import com.mojang.blaze3d.IndexType;
 import com.mojang.blaze3d.PrimitiveTopology;
 import com.mojang.blaze3d.GpuFormat;
 import com.mojang.blaze3d.buffers.GpuBuffer;
+import com.mojang.blaze3d.buffers.GpuBufferSlice;
 import com.mojang.blaze3d.pipeline.BlendFunction;
 import com.mojang.blaze3d.pipeline.ColorTargetState;
 import com.mojang.blaze3d.pipeline.DepthStencilState;
 import com.mojang.blaze3d.pipeline.RenderPipeline;
+import com.mojang.blaze3d.pipeline.BindGroupLayout;
+import com.mojang.blaze3d.shaders.UniformType;
 import com.mojang.blaze3d.platform.CompareOp;
 import com.mojang.blaze3d.systems.CommandEncoder;
 import com.mojang.blaze3d.systems.RenderPass;
@@ -20,6 +23,7 @@ import com.mojang.blaze3d.vertex.ByteBufferBuilder;
 import com.mojang.blaze3d.vertex.DefaultVertexFormat;
 import com.mojang.blaze3d.vertex.MeshData;
 import com.mojang.blaze3d.vertex.VertexFormat;
+import it.unimi.dsi.fastutil.longs.Long2IntOpenHashMap;
 import me.cortex.voxy.common.Logger;
 import me.cortex.voxy.common.world.WorldSection;
 import me.cortex.voxy.common.world.WorldEngine;
@@ -75,6 +79,7 @@ import org.joml.Vector4f;
 import org.lwjgl.system.MemoryUtil;
 
 import java.nio.ByteBuffer;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.ArrayDeque;
@@ -100,7 +105,29 @@ import java.util.concurrent.atomic.AtomicLong;
  * without a long render-thread stall.
  */
 public final class VoxyBlaze3DProbeRenderer {
-    private static final VertexFormat LOD_VERTEX_FORMAT = DefaultVertexFormat.POSITION_TEX_LIGHTMAP_COLOR;
+    private static final VertexFormat LOD_CORNER_FORMAT = VertexFormat.builder(0)
+            .addAttribute("Corner", GpuFormat.RG32_FLOAT).build();
+    private static final VertexFormat LOD_INSTANCE_FORMAT = VertexFormat.builder(1)
+            .addAttribute("QuadData", GpuFormat.RG32_UINT).build();
+    private static final BindGroupLayout LOD_TABLE_LAYOUT = BindGroupLayout.builder()
+            .withUniform("VoxySection", UniformType.UNIFORM_BUFFER)
+            .withUniform("VoxyLighting", UniformType.UNIFORM_BUFFER)
+            .withUniform("VoxyModelFaces", UniformType.TEXEL_BUFFER, GpuFormat.RGBA32_UINT)
+            .withUniform("VoxyModelInfo", UniformType.TEXEL_BUFFER, GpuFormat.RGBA32_UINT)
+            .withUniform("VoxyColours", UniformType.TEXEL_BUFFER, GpuFormat.R32_UINT)
+            .withUniform("VoxyCoverage", UniformType.UNIFORM_BUFFER)
+            .withUniform("VoxyOcclusionOrigins", UniformType.TEXEL_BUFFER, GpuFormat.RGBA32_FLOAT)
+            .withSampler("VoxyVisibility")
+            .withSampler("VoxySodiumMask").build();
+    private static Blaze3dSodiumCoverage sodiumColumns = Blaze3dSodiumCoverage.empty();
+    private static final Blaze3dSodiumMask sodiumMask = new Blaze3dSodiumMask();
+    private static final Blaze3dSodiumVisibility sodiumVisibility = new Blaze3dSodiumVisibility();
+    private static int lastSodiumCulledMeshes;
+    private static final Blaze3dOcclusion gpuOcclusion = new Blaze3dOcclusion();
+    private static boolean lodOcclusionEnabled;
+    private static final Blaze3dGpuProfiler gpuProfiler = new Blaze3dGpuProfiler();
+    private static int lastOccluderMeshes;
+    private static GpuBufferSlice lodLightingUniform;
     private static final int MARKER_VERTEX_COUNT = 36;
     private static final int MARKER_BUFFER_SIZE = MARKER_VERTEX_COUNT * DefaultVertexFormat.POSITION_TEX_COLOR.getVertexSize();
     private static final int LOG_INTERVAL_FRAMES = 600;
@@ -108,11 +135,15 @@ public final class VoxyBlaze3DProbeRenderer {
     private static final int LOD_INITIAL_REFRESH_INTERVAL_FRAMES = 1;
     private static final int LOD_STEADY_REFRESH_INTERVAL_FRAMES = 1;
     private static final int LOD_VALIDATIONS_PER_FRAME = 32;
+    private static final int LOD_IDLE_VALIDATIONS_PER_FRAME = 8;
     private static final long LOD_VALIDATION_BUDGET_NANOS = 1_000_000L;
     private static final long LOD_MEMORY_RETRY_FRAMES = 60L;
     private static final double ZOOM_RETAIN_DISTANCE = 512.0;
     private static final int MAX_ASYNC_MESHES = 32;
+    private static final long LOD_UPLOAD_BUDGET_NANOS = 2_000_000L;
+    private static final long LOD_UPLOAD_BUDGET_BYTES = 8L * 1024L * 1024L;
     private static final int LOD_SELECTION_NODES_PER_FRAME = 512;
+    private static final int LOD_SELECTION_PUBLISH_INTERVAL_FRAMES = 8;
     private static final int LOD_HIERARCHY_RECHECKS_PER_FRAME = 128;
     private static final long LOD_SELECTION_BUDGET_NANOS = 4_000_000L;
     private static final double LOD_SELECTION_MOVEMENT_BLOCKS = 8.0;
@@ -127,7 +158,7 @@ public final class VoxyBlaze3DProbeRenderer {
     private static final int MAX_LOD_QUAD_COUNT_PER_SECTION = 65536;
     private static final int LOD_VERTICES_PER_QUAD = 4;
     private static final int LOD_INDICES_PER_QUAD = 6;
-    private static final int LOD_INDEX_BUFFER_SIZE = MAX_LOD_QUAD_COUNT_PER_SECTION * LOD_INDICES_PER_QUAD * Integer.BYTES;
+    private static final int LOD_INDEX_BUFFER_SIZE = LOD_INDICES_PER_QUAD * Integer.BYTES;
     private static final float LOD_FAR_CLIP_BLOCKS = 16.0f * 3000.0f;
     private static final int PROJECTION_UNIFORM_BYTES = 16 * Float.BYTES;
     private static final int COMPOSITE_VERTEX_COUNT = 4;
@@ -152,19 +183,20 @@ public final class VoxyBlaze3DProbeRenderer {
     };
     private static final RenderPipeline MARKER_PIPELINE = createTexturedMarkerPipeline();
     // Minecraft 26.2 uses reverse-Z depth: larger values are closer to the camera.
-    private static final RenderPipeline LOD_PIPELINE = createTexturedTerrainPipeline(
+    private static final Blaze3dDiscardPipelines LOD_PIPELINE = createTexturedTerrainPipeline(
             "blaze3d_lod_probe_terrain", CompareOp.GREATER_THAN, true, false);
-    private static final RenderPipeline LOD_WATER_PIPELINE = createTexturedTerrainPipeline(
+    private static final Blaze3dDiscardPipelines LOD_WATER_PIPELINE = createTexturedTerrainPipeline(
             "blaze3d_lod_probe_water", CompareOp.GREATER_THAN, true, false);
-    private static final RenderPipeline LOD_OVERLAY_PIPELINE = createTexturedTerrainPipeline(
+    private static final Blaze3dDiscardPipelines LOD_OVERLAY_PIPELINE = createTexturedTerrainPipeline(
             "blaze3d_lod_probe_terrain_overlay", CompareOp.ALWAYS_PASS, false, false);
-    private static final RenderPipeline LOD_WATER_OVERLAY_PIPELINE = createTexturedTerrainPipeline(
+    private static final Blaze3dDiscardPipelines LOD_WATER_OVERLAY_PIPELINE = createTexturedTerrainPipeline(
             "blaze3d_lod_probe_water_overlay", CompareOp.ALWAYS_PASS, false, true);
-    private static final RenderPipeline LOD_COMPOSITE_PIPELINE = createCompositePipeline(
+    private static final Blaze3dDiscardPipelines LOD_COMPOSITE_PIPELINE = createCompositePipeline(
             "blaze3d_lod_composite", true, false);
-    private static final RenderPipeline LOD_TRANSLUCENT_COMPOSITE_PIPELINE = createCompositePipeline(
+    private static final Blaze3dDiscardPipelines LOD_TRANSLUCENT_COMPOSITE_PIPELINE = createCompositePipeline(
             "blaze3d_lod_translucent_composite", false, true);
-    private static final RenderPipeline GLOBAL_FOG_PIPELINE = createGlobalFogPipeline();
+    private static final Blaze3dDiscardPipelines GLOBAL_FOG_PIPELINE = createGlobalFogPipeline();
+    private static final Blaze3dDiscardPipelines LOD_DEPTH_SEED_PIPELINE = Blaze3dAuxiliaryPipelines.SODIUM_DEPTH_VARIANTS;
 
     private static RenderPipeline createTexturedMarkerPipeline() {
         return RenderPipeline.builder()
@@ -180,25 +212,27 @@ public final class VoxyBlaze3DProbeRenderer {
                 .build();
     }
 
-    private static RenderPipeline createTexturedTerrainPipeline(String name, CompareOp depthTest, boolean writeDepth, boolean translucent) {
+    private static Blaze3dDiscardPipelines createTexturedTerrainPipeline(String name, CompareOp depthTest, boolean writeDepth, boolean translucent) {
         RenderPipeline.Builder builder = RenderPipeline.builder()
             .withLocation(Identifier.fromNamespaceAndPath("voxy", name))
             .withBindGroupLayout(BindGroupLayouts.MATRICES_PROJECTION)
             .withBindGroupLayout(BindGroupLayouts.FOG)
             .withBindGroupLayout(BindGroupLayouts.SAMPLER0_SAMPLER2)
+            .withBindGroupLayout(LOD_TABLE_LAYOUT)
             .withVertexShader(Identifier.fromNamespaceAndPath("voxy", "core/blaze3d_lod_terrain"))
             .withFragmentShader(Identifier.fromNamespaceAndPath("voxy", "core/blaze3d_lod_terrain"))
-            .withVertexBinding(0, LOD_VERTEX_FORMAT)
+            .withVertexBinding(0, LOD_CORNER_FORMAT)
+            .withVertexBinding(1, LOD_INSTANCE_FORMAT)
             .withPrimitiveTopology(PrimitiveTopology.TRIANGLES)
             .withDepthStencilState(new DepthStencilState(depthTest, writeDepth))
             .withCull(false);
         if (translucent) {
             builder.withColorTargetState(new ColorTargetState(BlendFunction.TRANSLUCENT));
         }
-        return builder.build();
+        return Blaze3dDiscardPipelines.build(builder);
     }
 
-    private static RenderPipeline createCompositePipeline(String name, boolean writeDepth, boolean translucent) {
+    private static Blaze3dDiscardPipelines createCompositePipeline(String name, boolean writeDepth, boolean translucent) {
         RenderPipeline.Builder builder = RenderPipeline.builder()
                 .withLocation(Identifier.fromNamespaceAndPath("voxy", name))
                 .withBindGroupLayout(BindGroupLayouts.MATRICES_PROJECTION)
@@ -212,11 +246,11 @@ public final class VoxyBlaze3DProbeRenderer {
         if (translucent) {
             builder.withColorTargetState(new ColorTargetState(BlendFunction.TRANSLUCENT));
         }
-        return builder.build();
+        return Blaze3dDiscardPipelines.build(builder);
     }
 
-    private static RenderPipeline createGlobalFogPipeline() {
-        return RenderPipeline.builder()
+    private static Blaze3dDiscardPipelines createGlobalFogPipeline() {
+        return Blaze3dDiscardPipelines.build(RenderPipeline.builder()
                 .withLocation(Identifier.fromNamespaceAndPath("voxy", "blaze3d_global_fog"))
                 .withBindGroupLayout(BindGroupLayouts.MATRICES_PROJECTION)
                 .withBindGroupLayout(BindGroupLayouts.FOG)
@@ -226,12 +260,12 @@ public final class VoxyBlaze3DProbeRenderer {
                 .withVertexBinding(0, DefaultVertexFormat.POSITION)
                 .withPrimitiveTopology(PrimitiveTopology.TRIANGLE_STRIP)
                 .withColorTargetState(new ColorTargetState(BlendFunction.TRANSLUCENT))
-                .withCull(false)
-                .build();
+                .withCull(false));
     }
 
     private static GpuBuffer markerVertexBuffer;
     private static GpuBuffer lodIndexBuffer;
+    private static GpuBuffer lodCornerBuffer;
     private static GpuBuffer lodProjectionBuffer;
     private static GpuBuffer globalFogProjectionBuffer;
     private static GpuBuffer compositeVertexBuffer;
@@ -249,7 +283,7 @@ public final class VoxyBlaze3DProbeRenderer {
     private static final Set<Long> zoomRetainedKeys = new HashSet<>();
     // Render-thread owned. Each native vertex allocation belongs to exactly one of this cache
     // or preparedLodMeshes; GPU eviction deliberately does not invalidate this CPU copy.
-    private static final Map<Long, CachedLodMesh> cachedLodMeshes = new HashMap<>();
+    private static final Map<Long, CachedLodMesh> cachedLodMeshes = new LinkedHashMap<>(256, 0.75f, true);
     private static long cachedLodMeshBytes;
     private static long lodMeshCacheBudgetBytes;
     private static long lodMeshCacheHits;
@@ -259,7 +293,7 @@ public final class VoxyBlaze3DProbeRenderer {
     private static float preZoomSubdivision;
     private static int preZoomMinimumLevel;
     private static final Map<Long, BudgetDeferredMesh> budgetDeferredMeshes = new HashMap<>();
-    private static final ConcurrentHashMap<Long, Long> pendingMeshFingerprints = new ConcurrentHashMap<>();
+    private static final ConcurrentHashMap<Long, PendingLodMesh> pendingMeshFingerprints = new ConcurrentHashMap<>();
     private static final ConcurrentLinkedDeque<PreparedLodMesh> preparedLodMeshes = new ConcurrentLinkedDeque<>();
     private static final AtomicLong preparedLodMeshBytes = new AtomicLong();
     private static volatile Set<Long> watchedLodKeys = Set.of();
@@ -278,7 +312,6 @@ public final class VoxyBlaze3DProbeRenderer {
     // Sodium collects these on the render thread before its translucent pass.  The OpenGL path
     // rasterizes the same sections into a depth mask; Blaze3D currently consumes them while meshing.
     private static final Set<Long> visibleVanillaSections = new HashSet<>();
-    private static final Set<Long> collectedVisibleVanillaSections = new HashSet<>();
     private static long visibleVanillaMaskRevision;
     private static boolean failed;
     private static boolean initialized;
@@ -291,16 +324,22 @@ public final class VoxyBlaze3DProbeRenderer {
     private static List<LodSectionCoordinate> transitionBuildSections = List.of();
     private static final Map<Long, Integer> transitionPendingChildren = new HashMap<>();
     private static final Set<Long> transitionParentKeys = new HashSet<>();
+    private static final Set<Long> bypassedIntermediateKeys = new HashSet<>();
     private static final Set<Long> transitionCoverageReadyKeys = new HashSet<>();
     private static final Set<Long> unavailableLodSections = new HashSet<>();
     private static double buildPriorityCameraX, buildPriorityCameraZ;
     private static double buildRingWidth = 256.0;
-    private static int activeBuildRing;
+    private static final Blaze3dLodStreaming.CoarseningCoverage coarseningCoverage =
+            new Blaze3dLodStreaming.CoarseningCoverage();
+    private static final List<LodSectionMesh> visibleLodMeshes = new ArrayList<>();
+    private static final List<LodSectionMesh> visibleWaterMeshes = new ArrayList<>();
     private static final ArrayDeque<Long> transitionRevealQueue = new ArrayDeque<>();
     private static final Set<Long> transitionRevealKeys = new HashSet<>();
     private static long lastTransitionRevealFrame = Long.MIN_VALUE;
     private static long lastFrameUploadBytes;
     private static int lastFrameUploadCount;
+    private static long lastFrameUploadNanos;
+    private static long lastFrameBufferCreateNanos;
     private static final FrustumIntersection currentDrawFrustum = new FrustumIntersection();
     private static boolean currentDrawFrustumValid;
     private static double currentDrawCameraX;
@@ -379,6 +418,191 @@ public final class VoxyBlaze3DProbeRenderer {
     // Screen-space selection may refine further, but it may never stop at a numerically greater
     // (coarser) level than this. L0 is finest and MAX_LOD_LAYER is coarsest.
     private static volatile int minimumLodLevel = WorldEngine.MAX_LOD_LAYER;
+    private static volatile Blaze3dBenchmark benchmark;
+    private static Blaze3dFingerprintCache fingerprintCache;
+    private static Object benchmarkLevel;
+    private static final boolean BENCHMARK_ENABLED = Boolean.parseBoolean(
+            System.getProperty("voxy.blaze3d.benchmark", "true"));
+    private static final String[] BENCHMARK_BANDS = {"0-128", "128-512", "512-1024", "1024-2048", "2048+"};
+    private static final boolean[][] benchmarkFirstDraw = new boolean[5][5];
+
+    /** Called even when no terrain renders, so startup waits and world exit remain observable. */
+    public static void updateBenchmarkSession() {
+        Minecraft client = Minecraft.getInstance();
+        Object level = BENCHMARK_ENABLED && VoxyConfig.CONFIG.isBlaze3dRenderingEnabled() ? client.level : null;
+        if (level != benchmarkLevel) {
+            if (benchmark != null) benchmark.endSession(level == null ? "world-left-or-renderer-disabled" : "dimension-changed");
+            benchmark = null;
+            benchmarkLevel = level;
+            for (boolean[] levels : benchmarkFirstDraw) java.util.Arrays.fill(levels, false);
+            if (level != null) {
+                try {
+                    String directory = System.getProperty("voxy.blaze3d.benchmarkDir");
+                    Path path = directory == null || directory.isBlank()
+                            ? client.gameDirectory.toPath().resolve("logs/voxy-benchmarks") : Path.of(directory);
+                    benchmark = new Blaze3dBenchmark(path,
+                            "build=" + VoxyCommon.BUILD_ID + " buildNumber=" + VoxyCommon.BUILD_NUMBER
+                                    + " dimension=" + client.level.dimension() + " java=" + System.getProperty("java.version")
+                                    + " os=" + System.getProperty("os.name") + " arch=" + System.getProperty("os.arch")
+                                    + " processors=" + Runtime.getRuntime().availableProcessors()
+                                    + " workers=" + VoxyConfig.CONFIG.serviceThreads
+                                    + " distanceBlocks=" + VoxyConfig.CONFIG.sectionRenderDistance * 512.0f
+                                    + " subdivision=" + VoxyConfig.CONFIG.subDivisionSize + " minLod=" + minimumLodLevel
+                                    + " uploadsPerFrame=" + getLodUploadsPerFrame()
+                                    + " selectionBudgetNs=" + LOD_SELECTION_BUDGET_NANOS
+                                    + " validationBudgetNs=" + LOD_VALIDATION_BUDGET_NANOS
+                                    + " uploadBudgetNs=" + LOD_UPLOAD_BUDGET_NANOS + " uploadBudgetBytes=" + LOD_UPLOAD_BUDGET_BYTES
+                                    + " maxPending=" + MAX_ASYNC_MESHES + " bytesPerQuad=" + Blaze3dSectionMesh.QUAD_STRIDE
+                                    + " sectionHeaderBytes=" + Blaze3dQuadEncoder.SECTION_BYTES,
+                            message -> Logger.warn(message));
+                    benchmark.event("SESSION_START", "initialized=" + initialized + " frame=" + frameCount);
+                    if (initialized) recordBenchmarkDevice();
+                    Logger.info("Automatic Blaze3D benchmark: " + benchmark.path());
+                } catch (RuntimeException exception) {
+                    Logger.warn("Automatic Blaze3D benchmark could not start: " + exception);
+                }
+            }
+        }
+        if (benchmark != null && !benchmark.active()) benchmark = null;
+        if (benchmark == null && renderGenerationService != null) renderGenerationService.setBuildObserver(null);
+        if (benchmark != null && benchmark.snapshotDue()) {
+            try {
+                recordBenchmarkSnapshot(benchmark);
+            } catch (RuntimeException exception) {
+                benchmark.event("ERROR", "snapshot exception=" + exception);
+                benchmark.endSession("snapshot-failed");
+                benchmark = null;
+                Logger.warn("Blaze3D benchmark snapshot failed: " + exception);
+            }
+        }
+    }
+
+    private static void benchmarkStage(Blaze3dBenchmark.Stage stage, long start) {
+        Blaze3dBenchmark session = benchmark;
+        if (session != null) session.stage(stage, profileElapsed(start));
+    }
+
+    private static void benchmarkCount(Blaze3dBenchmark.Counter counter) {
+        Blaze3dBenchmark session = benchmark;
+        if (session != null) session.count(counter);
+    }
+
+    private static void benchmarkEvent(String event, String detail) {
+        Blaze3dBenchmark session = benchmark;
+        if (session != null) session.event(event, detail);
+    }
+
+    private static void recordBenchmarkDevice() {
+        var deviceInfo = RenderSystem.getDevice().getDeviceInfo();
+        benchmarkEvent("DEVICE", "backend=" + deviceInfo.backendName() + " device=" + deviceInfo.name()
+                + " vendor=" + deviceInfo.vendorName() + " drawIndirect=" + deviceInfo.features().drawIndirect()
+                + " multiDrawIndirect=" + deviceInfo.features().multiDrawIndirect()
+                + " persistentMapping=" + deviceInfo.features().persistentMapping()
+                + " sampleMaskDiscard=" + Blaze3dDiscardPipelines.needsSampleMask());
+    }
+
+    private static void benchmarkFinished(long key, String outcome, long bytes) {
+        Blaze3dBenchmark session = benchmark;
+        if (session != null) session.finished(session.request(key), outcome, bytes);
+    }
+
+    private static WorldSection benchmarkAcquire(WorldEngine world, long key) {
+        long started = profileNow();
+        try {
+            return world.acquireIfExists(key);
+        } finally {
+            benchmarkStage(Blaze3dBenchmark.Stage.WORLD_ACQUIRE, started);
+            benchmarkCount(Blaze3dBenchmark.Counter.WORLD_ACQUIRES);
+        }
+    }
+
+    private static int benchmarkBand(long key) {
+        double distance = horizontalSectionDistance(new LodSectionCoordinate(key,
+                WorldEngine.getX(key), WorldEngine.getY(key), WorldEngine.getZ(key)), currentDrawCameraX, currentDrawCameraZ);
+        return distance < 128 ? 0 : distance < 512 ? 1 : distance < 1024 ? 2 : distance < 2048 ? 3 : 4;
+    }
+
+    private static void recordBenchmarkSnapshot(Blaze3dBenchmark session) {
+        long started = System.nanoTime();
+        session.event("STATE", "frame=" + frameCount + " initialized=" + initialized + " failed=" + failed
+                + " atlasReadbackPending=" + atlasReadbackPending + " mesherReady=" + (renderGenerationService != null)
+                + " " + (fingerprintCache == null ? "fingerprintCache=inactive" : fingerprintCache.summary())
+                + " camera=" + currentDrawCameraX + "," + currentDrawCameraY + "," + currentDrawCameraZ
+                + " cameraValid=" + currentDrawFrustumValid
+                + " viewport=" + lastLodSelectionViewportWidth + "x" + lastLodSelectionViewportHeight
+                + " subdivision=" + VoxyConfig.CONFIG.subDivisionSize + " minLod=" + minimumLodLevel
+                + " workers=" + VoxyConfig.CONFIG.serviceThreads + " uploadsPerFrame=" + getLodUploadsPerFrame()
+                + " distanceBlocks=" + VoxyConfig.CONFIG.sectionRenderDistance * 512.0f
+                + " " + getLodDebugSummary()
+                + " " + (blazeModelStore == null ? "textures=uninitialized" : blazeModelStore.benchmarkSummary()));
+        int[][][] counts = new int[7][5][5];
+        long[][] oldestPending = new long[5][5];
+        Long2IntOpenHashMap sodiumDescendants = new Long2IntOpenHashMap();
+        for (long sodium : visibleVanillaSections) {
+            for (int level = 0; level <= WorldEngine.MAX_LOD_LAYER; level++) {
+                long key = WorldEngine.getWorldSectionId(level, SectionPos.x(sodium) >> (level + 1),
+                        SectionPos.y(sodium) >> (level + 1), SectionPos.z(sodium) >> (level + 1));
+                sodiumDescendants.addTo(key, 1);
+            }
+        }
+        for (long key : selectedLodSectionKeys) {
+            int band = benchmarkBand(key), level = WorldEngine.getLevel(key);
+            counts[0][band][level]++;
+            if (lodMeshFingerprints.containsKey(key)) counts[1][band][level]++;
+        }
+        for (long key : lodMeshes.keySet()) {
+            int band = benchmarkBand(key), level = WorldEngine.getLevel(key);
+            counts[2][band][level]++;
+            if (isActiveRenderMesh(key)) counts[3][band][level]++;
+        }
+        for (LodSectionMesh mesh : visibleLodMeshes) {
+            long key = mesh.coordinate().key();
+            int band = benchmarkBand(key), level = WorldEngine.getLevel(key);
+            counts[4][band][level]++;
+            if (sodiumDescendants.get(key) > 0) counts[5][band][level]++;
+            if (!benchmarkFirstDraw[band][level]) {
+                benchmarkFirstDraw[band][level] = true;
+                session.event("FIRST_OBSERVED_DRAW_CANDIDATE", "band=" + BENCHMARK_BANDS[band] + " level=" + level + " frame=" + frameCount);
+            }
+        }
+        long now = System.nanoTime();
+        for (Blaze3dBenchmark.Request request : session.pending()) {
+            int band = benchmarkBand(request.key), level = request.level;
+            counts[6][band][level]++;
+            oldestPending[band][level] = Math.max(oldestPending[band][level], now - request.started);
+        }
+        for (int band = 0; band < 5; band++) {
+            StringBuilder row = new StringBuilder("band=").append(BENCHMARK_BANDS[band]).append(" order=L0,L1,L2,L3,L4");
+            String[] labels = {"selected", "readyIncludingEmpty", "resident", "activeResident", "drawCandidates", "drawWithSodiumOverlap", "pending"};
+            for (int metric = 0; metric < labels.length; metric++) row.append(' ').append(labels[metric]).append('=')
+                    .append(java.util.Arrays.toString(counts[metric][band]));
+            row.append(" oldestPendingNs=").append(java.util.Arrays.toString(oldestPending[band]));
+            session.event("DISTANCE", row.toString());
+        }
+        int cameraSectionX = (int) Math.floor(currentDrawCameraX / 16.0);
+        int cameraSectionY = (int) Math.floor(currentDrawCameraY / 16.0);
+        int cameraSectionZ = (int) Math.floor(currentDrawCameraZ / 16.0);
+        for (int level = 0; level <= WorldEngine.MAX_LOD_LAYER; level++) {
+            long key = WorldEngine.getWorldSectionId(level, cameraSectionX >> (level + 1),
+                    cameraSectionY >> (level + 1), cameraSectionZ >> (level + 1));
+            LodSectionMesh mesh = lodMeshes.get(key);
+            Blaze3dBenchmark.Request request = session.request(key);
+            session.event("CAMERA_BRANCH", "level=" + level + " key=" + key
+                    + " selected=" + selectedLodSectionKeys.contains(key) + " resident=" + (mesh != null)
+                    + " ready=" + lodMeshFingerprints.containsKey(key) + " transitionParent=" + transitionParentKeys.contains(key)
+                    + " pendingChildren=" + transitionPendingChildren.getOrDefault(key, 0)
+                    + " hiddenByAncestor=" + isCoveredByCoarserMesh(new LodSectionCoordinate(key, WorldEngine.getX(key), WorldEngine.getY(key), WorldEngine.getZ(key)))
+                    + " bypassed=" + bypassedIntermediateKeys.contains(key) + " unavailable=" + unavailableLodSections.contains(key)
+                    + " budgetDeferred=" + budgetDeferredMeshes.containsKey(key)
+                    + " sodiumVisibleDescendants=" + sodiumDescendants.get(key)
+                    + " cameraSodiumSectionVisible=" + visibleVanillaSections.contains(SectionPos.asLong(cameraSectionX, cameraSectionY, cameraSectionZ))
+                    + " pendingNs=" + (request == null ? 0 : now - request.started)
+                    + " bytes=" + (mesh == null ? 0 : geometryBytes(mesh)));
+        }
+        long overhead = System.nanoTime() - started;
+        session.stage(Blaze3dBenchmark.Stage.SNAPSHOT, overhead);
+        session.event("SNAPSHOT_COST", "ns=" + overhead + " " + session.counterSummary());
+    }
 
     private VoxyBlaze3DProbeRenderer() {
     }
@@ -441,7 +665,15 @@ public final class VoxyBlaze3DProbeRenderer {
                 + ", pendingHandoffs=" + transitionRevealQueue.size()
                 + ", frameUploads=" + lastFrameUploadCount + "/" + formatBytes(lastFrameUploadBytes)
                 + ", uploadLimit=" + getLodUploadsPerFrame()
-                + ", loadingRing=" + activeBuildRing + ", innerRingBlocks=" + Math.round(buildRingWidth)
+                + ", uploadMillis=" + formatMillis(lastFrameUploadNanos)
+                + ", bufferCreateMillis=" + formatMillis(lastFrameBufferCreateNanos)
+                + ", quadBytes=" + Blaze3dSectionMesh.QUAD_STRIDE
+                + ", sectionHeaderBytes=" + Blaze3dQuadEncoder.SECTION_BYTES
+                + ", sodiumCulledMeshes=" + lastSodiumCulledMeshes
+                + ", " + gpuOcclusion.summary() + " occluderMeshes=" + lastOccluderMeshes
+                + ", bypassedIntermediate=" + bypassedIntermediateKeys.size()
+                + ", coarseningFallbacks=" + coarseningCoverage.size()
+                + ", innerRingBlocks=" + Math.round(buildRingWidth)
                 + ", selectionRuns=" + lodSelectionRuns
                 + ", topologyChanges=" + lodTopologyChanges
                 + ", priorityOnly=" + lodPriorityOnlyChanges
@@ -493,11 +725,19 @@ public final class VoxyBlaze3DProbeRenderer {
     }
 
     public static void beginVisibleVanillaSectionCollection() {
-        collectedVisibleVanillaSections.clear();
+        beginVisibleVanillaSectionCollection(false);
+    }
+
+    public static void beginVisibleVanillaSectionCollection(boolean outOfGraph) {
+        sodiumVisibility.begin(outOfGraph);
     }
 
     public static void recordVisibleVanillaSection(int sectionX, int sectionY, int sectionZ) {
-        collectedVisibleVanillaSections.add(SectionPos.asLong(sectionX, sectionY, sectionZ));
+        sodiumVisibility.record(SectionPos.asLong(sectionX, sectionY, sectionZ));
+    }
+
+    public static void forgetVisibleVanillaChunk(int chunkX, int chunkZ) {
+        sodiumVisibility.forget(section -> SectionPos.x(section) == chunkX && SectionPos.z(section) == chunkZ);
     }
 
     /**
@@ -506,11 +746,13 @@ public final class VoxyBlaze3DProbeRenderer {
      */
     public static void renderOpaque(ChunkRenderMatrices matrices, GpuTextureView colorTarget, GpuTextureView depthTarget,
                                     CameraTransform camera, FogParameters fogParameters) {
+        updateBenchmarkSession();
         if (failed || IrisUtil.irisShadowActive()) {
             return;
         }
 
         try {
+            if (benchmark != null) benchmark.beginFrame(frameCount + 1, camera.x, camera.y, camera.z);
             long frameStart = profileNow();
             profiledSelectionNanos = 0;
             profiledMeshBuildNanos = 0;
@@ -520,7 +762,9 @@ public final class VoxyBlaze3DProbeRenderer {
             long maskStart = profileNow();
             commitVisibleVanillaSectionMask();
             long maskNanos = profileElapsed(maskStart);
+            benchmarkStage(Blaze3dBenchmark.Stage.MASK, maskStart);
 
+            long targetsStart = profileNow();
             CommandEncoder encoder = RenderSystem.getDevice().createCommandEncoder();
             ensureOffscreenTargets(colorTarget);
             ensureSodiumCoverageDepth(depthTarget);
@@ -530,13 +774,61 @@ public final class VoxyBlaze3DProbeRenderer {
                     0, 0, 0, 0, 0, depthTarget.getWidth(0), depthTarget.getHeight(0));
             encoder.clearColorAndDepthTextures(lodColorTexture, new Vector4f(0.0f), lodDepthTexture, 0.0);
             uploadLodProjection(encoder, matrices.projection());
+            sodiumMask.update(encoder, sodiumColumns, vanillaTransitionChunks * 16.0f);
+            gpuProfiler.beginFrame(frameCount + 1, benchmark != null, detail -> benchmarkEvent("GPU", detail));
+            gpuProfiler.begin(encoder, Blaze3dGpuProfiler.Stage.SODIUM_DEPTH);
+            seedSodiumDepth(encoder, matrices);
+            gpuProfiler.end(encoder, Blaze3dGpuProfiler.Stage.SODIUM_DEPTH);
             if (testCubeVisible) {
                 uploadMarker(encoder, camera);
             }
+            benchmarkStage(Blaze3dBenchmark.Stage.TARGETS, targetsStart);
             long refreshStart = profileNow();
             refreshLodMeshes(encoder, matrices, camera, colorTarget.getWidth(0), colorTarget.getHeight(0));
             long refreshNanos = profileElapsed(refreshStart);
+            benchmarkStage(Blaze3dBenchmark.Stage.REFRESH, refreshStart);
             long drawStart = profileNow();
+            long cullStart = profileNow();
+            updateVisibleLodMeshes();
+            Matrix4f occlusionView = createLodProjection(matrices.projection()).mul(new Matrix4f(matrices.modelView())
+                    .translate((float) -camera.x, (float) -camera.y, (float) -camera.z));
+            boolean useOcclusion = !renderLodAboveTerrain && visibleLodMeshes.size() > 512;
+            gpuOcclusion.prepare(colorTarget.getWidth(0), colorTarget.getHeight(0), useOcclusion);
+            lodOcclusionEnabled = false;
+            lastOpaqueDrawCalls = 0;
+            lastOpaqueVertices = 0;
+            lastOccluderMeshes = 0;
+            if (useOcclusion) {
+                int opaqueOccluders = 0;
+                while (lastOccluderMeshes < visibleLodMeshes.size() && opaqueOccluders < 256) {
+                    if (visibleLodMeshes.get(lastOccluderMeshes++).opaqueQuadCount() != 0) opaqueOccluders++;
+                }
+            }
+            if (useOcclusion) {
+                for (LodSectionMesh mesh : visibleLodMeshes) {
+                    float scale = 1 << WorldEngine.getLevel(mesh.coordinate().key());
+                    float size = SECTION_EDGE * scale;
+                    gpuOcclusion.candidate(mesh.coordinate().x() * size, mesh.coordinate().y() * size,
+                            mesh.coordinate().z() * size, scale, mesh.aabb(), mesh.opaqueQuadCount(), mesh.waterQuadCount());
+                }
+            }
+            uploadLodLighting(encoder);
+            benchmarkStage(Blaze3dBenchmark.Stage.CULL, cullStart);
+            if (useOcclusion) {
+                gpuProfiler.begin(encoder, Blaze3dGpuProfiler.Stage.OCCLUDERS);
+                try (RenderPass pass = encoder.createRenderPass(() -> "Voxy near terrain occluders",
+                        lodColorTextureView, Optional.empty(), lodDepthTextureView, OptionalDouble.empty())) {
+                    preparePass(pass, matrices, camera, fogParameters, true);
+                    drawOpaqueLods(pass, 0, lastOccluderMeshes);
+                }
+                gpuProfiler.end(encoder, Blaze3dGpuProfiler.Stage.OCCLUDERS);
+                gpuProfiler.begin(encoder, Blaze3dGpuProfiler.Stage.HIZ);
+                gpuOcclusion.capture(encoder, lodDepthTextureView, compositeVertexBuffer, occlusionView);
+                gpuProfiler.end(encoder, Blaze3dGpuProfiler.Stage.HIZ);
+                lodOcclusionEnabled = true;
+                uploadLodLighting(encoder);
+            }
+            gpuProfiler.begin(encoder, Blaze3dGpuProfiler.Stage.OPAQUE);
             try (RenderPass pass = encoder.createRenderPass(
                     () -> "Voxy Blaze3D offscreen opaque",
                     lodColorTextureView,
@@ -553,15 +845,21 @@ public final class VoxyBlaze3DProbeRenderer {
                 }
                 preparePass(pass, matrices, camera, fogParameters, true);
                 if (!renderLodAboveTerrain) {
-                    drawOpaqueLods(pass);
+                    drawOpaqueLods(pass, lastOccluderMeshes, visibleLodMeshes.size());
                 }
             }
+            gpuProfiler.end(encoder, Blaze3dGpuProfiler.Stage.OPAQUE);
             encoder.copyTextureToTexture(
                     lodDepthTexture, lodOpaqueDepthTexture,
                     0, 0, 0, 0, 0,
                     lodDepthTexture.getWidth(0), lodDepthTexture.getHeight(0));
+            gpuProfiler.begin(encoder, Blaze3dGpuProfiler.Stage.OPAQUE_COMPOSITE);
             compositeOffscreen(encoder, matrices, colorTarget, depthTarget, false);
+            gpuProfiler.end(encoder, Blaze3dGpuProfiler.Stage.OPAQUE_COMPOSITE);
             long drawNanos = profileElapsed(drawStart);
+            benchmarkStage(Blaze3dBenchmark.Stage.DRAW, drawStart);
+            benchmarkStage(Blaze3dBenchmark.Stage.OPAQUE, frameStart);
+            if (benchmark != null) benchmark.geometry(lastFrameUploadCount, lastFrameUploadBytes, lastOpaqueDrawCalls);
 
             frameCount++;
             logPerformanceSample("opaque", profileElapsed(frameStart), maskNanos, refreshNanos, drawNanos, 0L);
@@ -573,6 +871,7 @@ public final class VoxyBlaze3DProbeRenderer {
             }
         } catch (RuntimeException exception) {
             failed = true;
+            benchmarkEvent("ERROR", "opaque frame=" + (frameCount + 1) + " exception=" + exception);
             Logger.error("Blaze3D probe opaque pass failed on frame " + (frameCount + 1)
                     + "; disabling the Blaze3D LoD renderer for this session.", exception);
         }
@@ -594,7 +893,11 @@ public final class VoxyBlaze3DProbeRenderer {
             updateCurrentDrawFrustum(matrices, camera);
             CommandEncoder encoder = RenderSystem.getDevice().createCommandEncoder();
             ensureOffscreenTargets(colorTarget);
-            encoder.clearColorAndDepthTextures(lodColorTexture, new Vector4f(0.0f), lodDepthTexture, 0.0);
+            uploadLodLighting(encoder);
+            gpuProfiler.begin(encoder, Blaze3dGpuProfiler.Stage.WATER);
+            encoder.clearColorTexture(lodColorTexture, new Vector4f(0.0f));
+            encoder.copyTextureToTexture(lodOpaqueDepthTexture, lodDepthTexture,
+                    0, 0, 0, 0, 0, lodDepthTexture.getWidth(0), lodDepthTexture.getHeight(0));
             try (RenderPass pass = encoder.createRenderPass(
                     () -> "Voxy Blaze3D offscreen translucent",
                     lodColorTextureView,
@@ -603,14 +906,22 @@ public final class VoxyBlaze3DProbeRenderer {
                     OptionalDouble.empty())) {
                 preparePass(pass, matrices, camera, fogParameters, true);
                 if (renderLodAboveTerrain) {
-                    drawOpaqueLods(pass);
+                    lastOpaqueDrawCalls = 0;
+                    lastOpaqueVertices = 0;
+                    drawOpaqueLods(pass, 0, visibleLodMeshes.size());
                 }
                 drawWaterLods(pass, camera);
             }
+            gpuProfiler.end(encoder, Blaze3dGpuProfiler.Stage.WATER);
+            gpuProfiler.begin(encoder, Blaze3dGpuProfiler.Stage.WATER_COMPOSITE);
             compositeOffscreen(encoder, matrices, colorTarget, depthTarget, true);
+            gpuProfiler.end(encoder, Blaze3dGpuProfiler.Stage.WATER_COMPOSITE);
+            benchmarkStage(Blaze3dBenchmark.Stage.WATER, waterStart);
+            if (benchmark != null) benchmark.waterDraws(lastWaterDrawCalls);
             logPerformanceSample("water", profileElapsed(waterStart), 0L, 0L, 0L, profileElapsed(waterStart));
         } catch (RuntimeException exception) {
             failed = true;
+            benchmarkEvent("ERROR", "water frame=" + frameCount + " exception=" + exception);
             Logger.error("Blaze3D probe water pass failed on frame " + frameCount
                     + "; disabling the Blaze3D LoD renderer for this session.", exception);
         }
@@ -627,6 +938,7 @@ public final class VoxyBlaze3DProbeRenderer {
             return;
         }
 
+        long fogStart = profileNow();
         try {
             RenderSystem.assertOnRenderThread();
             initialize();
@@ -651,6 +963,7 @@ public final class VoxyBlaze3DProbeRenderer {
             boolean zeroToOne = RenderSystem.getDevice().getDeviceInfo().isZZeroToOne();
 
             CommandEncoder encoder = RenderSystem.getDevice().createCommandEncoder();
+            gpuProfiler.begin(encoder, Blaze3dGpuProfiler.Stage.FOG);
             uploadGlobalFogProjection(encoder, minecraftReconstruction);
             try (RenderPass pass = encoder.createRenderPass(
                     () -> "Voxy Blaze3D global terrain fog",
@@ -664,7 +977,7 @@ public final class VoxyBlaze3DProbeRenderer {
                         minecraftViewProjection));
                 pass.setUniform("Projection", globalFogProjectionBuffer.slice());
                 pass.setUniform("Fog", RenderSystem.getShaderFog());
-                pass.setPipeline(GLOBAL_FOG_PIPELINE);
+                pass.setPipeline(GLOBAL_FOG_PIPELINE.get());
                 pass.bindTexture("Sampler0", depthTarget,
                         RenderSystem.getSamplerCache().getClampToEdge(FilterMode.NEAREST));
                 pass.bindTexture("Sampler1", lodOpaqueDepthTextureView,
@@ -672,9 +985,13 @@ public final class VoxyBlaze3DProbeRenderer {
                 pass.setVertexBuffer(0, compositeVertexBuffer.slice());
                 pass.draw(COMPOSITE_VERTEX_COUNT, 1, 0, 0);
             }
+            gpuProfiler.end(encoder, Blaze3dGpuProfiler.Stage.FOG);
         } catch (RuntimeException exception) {
             failed = true;
+            benchmarkEvent("ERROR", "fog frame=" + frameCount + " exception=" + exception);
             Logger.error("Blaze3D global terrain fog pass failed; restoring Minecraft fog next frame.", exception);
+        } finally {
+            benchmarkStage(Blaze3dBenchmark.Stage.FOG, fogStart);
         }
     }
 
@@ -713,12 +1030,29 @@ public final class VoxyBlaze3DProbeRenderer {
                     new Vector4f(viewRotation.m10(), viewRotation.m11(), viewRotation.m12(), 1.0f),
                     new Vector3f(zeroToOne ? 1.0f : 0.0f, transitionStart, transitionEnd),
                     new Matrix4f(matrices.projection())));
-            pass.setPipeline(translucent ? LOD_TRANSLUCENT_COMPOSITE_PIPELINE : LOD_COMPOSITE_PIPELINE);
+            pass.setPipeline((translucent ? LOD_TRANSLUCENT_COMPOSITE_PIPELINE : LOD_COMPOSITE_PIPELINE).get());
             pass.bindTexture("Sampler0", lodColorTextureView,
                     RenderSystem.getSamplerCache().getClampToEdge(FilterMode.LINEAR));
             pass.bindTexture("Sampler1", lodDepthTextureView,
                     RenderSystem.getSamplerCache().getClampToEdge(FilterMode.NEAREST));
             pass.bindTexture("Sampler2", sodiumCoverageDepthTextureView,
+                    RenderSystem.getSamplerCache().getClampToEdge(FilterMode.NEAREST));
+            pass.setVertexBuffer(0, compositeVertexBuffer.slice());
+            pass.draw(COMPOSITE_VERTEX_COUNT, 1, 0, 0);
+        }
+    }
+
+    private static void seedSodiumDepth(CommandEncoder encoder, ChunkRenderMatrices matrices) {
+        if (renderLodAboveTerrain) return;
+        try (RenderPass pass = encoder.createRenderPass(() -> "Voxy Sodium depth prefill", lodColorTextureView,
+                Optional.empty(), lodDepthTextureView, OptionalDouble.empty())) {
+            RenderSystem.bindDefaultUniforms(pass);
+            pass.setPipeline(LOD_DEPTH_SEED_PIPELINE.get());
+            pass.setUniform("DynamicTransforms", RenderSystem.getDynamicUniforms().writeTransform(
+                    new Matrix4f(matrices.projection()).invert(), new Vector4f(1),
+                    new Vector3f(RenderSystem.getDevice().getDeviceInfo().isZZeroToOne() ? 1 : 0, 0, 0),
+                    createLodProjection(matrices.projection())));
+            pass.bindTexture("Sampler0", sodiumCoverageDepthTextureView,
                     RenderSystem.getSamplerCache().getClampToEdge(FilterMode.NEAREST));
             pass.setVertexBuffer(0, compositeVertexBuffer.slice());
             pass.draw(COMPOSITE_VERTEX_COUNT, 1, 0, 0);
@@ -939,67 +1273,135 @@ public final class VoxyBlaze3DProbeRenderer {
     }
 
     private static boolean isActiveRenderMesh(long sectionKey) {
-        return selectedLodSectionKeys.contains(sectionKey) || transitionParentKeys.contains(sectionKey);
+        return selectedLodSectionKeys.contains(sectionKey) || transitionParentKeys.contains(sectionKey)
+                || coarseningCoverage.retains(sectionKey);
     }
 
-    private static void drawOpaqueLods(RenderPass pass) {
-        lastOpaqueDrawCalls = 0;
-        lastOpaqueVertices = 0;
+    private static void updateVisibleLodMeshes() {
+        visibleLodMeshes.clear();
+        visibleWaterMeshes.clear();
+        lastSodiumCulledMeshes = 0;
+        // More available VRAM should enlarge the dormant cache without increasing every
+        // frame's culling work. Visit active keys only and avoid allocating a union set.
+        for (long key : selectedLodSectionKeys) addVisibleLodMesh(key);
+        for (long key : transitionParentKeys) {
+            if (!selectedLodSectionKeys.contains(key)) addVisibleLodMesh(key);
+        }
+        for (long key : coarseningCoverage.retainedKeys()) {
+            if (!selectedLodSectionKeys.contains(key) && !transitionParentKeys.contains(key)) addVisibleLodMesh(key);
+        }
+        // Near opaque surfaces populate depth first, allowing hardware early-Z to reject terrain behind them.
+        visibleLodMeshes.sort(Comparator.comparingDouble(mesh -> distanceSquaredToCamera(mesh.coordinate(),
+                currentDrawCameraX, currentDrawCameraY, currentDrawCameraZ)));
+    }
+
+    private static void addVisibleLodMesh(long key) {
+        LodSectionMesh mesh = lodMeshes.get(key);
+        if (mesh != null && isInsideCurrentDrawFrustum(mesh.coordinate())
+                && !isCoveredByCoarserMesh(mesh.coordinate())) {
+            int size = SECTION_EDGE << WorldEngine.getLevel(key);
+            double x = (double) mesh.coordinate().x() * size, z = (double) mesh.coordinate().z() * size;
+            if (sodiumColumns.covers(x, z, x + size, z + size, vanillaTransitionChunks > 0)) {
+                lastSodiumCulledMeshes++;
+                return;
+            }
+            visibleLodMeshes.add(mesh);
+            if (mesh.waterQuadCount() != 0) visibleWaterMeshes.add(mesh);
+        }
+    }
+
+    private static void uploadLodLighting(CommandEncoder encoder) {
+        CardinalLighting lighting = Minecraft.getInstance().level.cardinalLighting();
+        ByteBuffer data = encoder.transientMemory().allocateCpu(32, Float.BYTES).order(ByteOrder.nativeOrder());
+        data.putFloat(quantizeShade(lighting.up())).putFloat(quantizeShade(lighting.down()))
+                .putFloat(quantizeShade(lighting.north())).putFloat(quantizeShade(lighting.east()));
+        data.putFloat((float) currentDrawCameraX).putFloat((float) currentDrawCameraY)
+                .putFloat((float) currentDrawCameraZ).putFloat(lodOcclusionEnabled && !gpuOcclusion.hasIndirect() ? 1 : 0).flip();
+        lodLightingUniform = encoder.transientMemory().uploadGpu(data,
+                RenderSystem.getDevice().getDeviceInfo().limits().minUniformOffsetAlignment(), GpuBuffer.USAGE_UNIFORM);
+    }
+
+    private static float quantizeShade(float shade) {
+        return Math.clamp(Math.round(shade * 255.0f), 0, 255) / 255.0f;
+    }
+
+    private static void bindLodTables(RenderPass pass) {
+        blazeModelStore.bindModelTables(pass);
+        pass.setUniform("VoxyLighting", lodLightingUniform);
+        sodiumMask.bind(pass);
+        gpuOcclusion.bind(pass);
+    }
+
+    private static void drawOpaqueLods(RenderPass pass, int first, int end) {
         if (blazeModelStore == null) {
             return;
         }
-        pass.setPipeline(renderLodAboveTerrain ? LOD_OVERLAY_PIPELINE : LOD_PIPELINE);
+        pass.setPipeline((renderLodAboveTerrain ? LOD_OVERLAY_PIPELINE : LOD_PIPELINE).get());
+        bindLodTables(pass);
         pass.setUniform("Fog", RenderSystem.getShaderFog());
         pass.bindTexture("Sampler0", blazeModelStore.atlasView(), blazeModelStore.atlasSampler());
         pass.bindTexture("Sampler2", Minecraft.getInstance().gameRenderer.levelLightmap(),
                 RenderSystem.getSamplerCache().getClampToEdge(FilterMode.LINEAR));
         pass.setIndexBuffer(lodIndexBuffer, IndexType.INT);
-        for (LodSectionMesh mesh : lodMeshes.values()) {
-            if (mesh.opaqueVertexCount() != 0
-                    && isActiveRenderMesh(mesh.coordinate().key())
-                    && isInsideCurrentDrawFrustum(mesh.coordinate())
-                    && !isCoveredByCoarserMesh(mesh.coordinate())) {
-                pass.setVertexBuffer(0, mesh.opaqueVertexBuffer().slice());
-                pass.drawIndexed(indexCount(mesh.opaqueVertexCount()), 1, 0, 0, 0);
+        pass.setVertexBuffer(0, lodCornerBuffer.slice());
+        for (int index = first; index < end; index++) {
+            LodSectionMesh mesh = visibleLodMeshes.get(index);
+            if (mesh.opaqueQuadCount() != 0) {
+                pass.setUniform("VoxySection", mesh.sectionUniform());
+                pass.setVertexBuffer(1, mesh.opaqueInstances());
+                drawLodMesh(pass, mesh, false);
                 lastOpaqueDrawCalls++;
-                lastOpaqueVertices += mesh.opaqueVertexCount();
+                lastOpaqueVertices += mesh.opaqueQuadCount() * LOD_VERTICES_PER_QUAD;
             }
+        }
+    }
+
+    private static void drawLodMesh(RenderPass pass, LodSectionMesh mesh, boolean water) {
+        GpuBufferSlice command = null;
+        if (lodOcclusionEnabled) {
+            float scale = 1 << WorldEngine.getLevel(mesh.coordinate().key());
+            float size = SECTION_EDGE * scale;
+            command = gpuOcclusion.command(mesh.coordinate().x() * size, mesh.coordinate().y() * size,
+                    mesh.coordinate().z() * size, scale, water);
+        }
+        if (command != null) {
+            pass.drawIndexedIndirect(command, 1);
+        } else {
+            pass.drawIndexed(LOD_INDICES_PER_QUAD, water ? mesh.waterQuadCount() : mesh.opaqueQuadCount(), 0, 0, 0);
         }
     }
 
     private static void drawWaterLods(RenderPass pass, CameraTransform camera) {
         lastWaterDrawCalls = 0;
         lastWaterVertices = 0;
-        List<LodSectionMesh> waterMeshes = lodMeshes.values().stream()
-                .filter(mesh -> mesh.waterVertexCount() != 0
-                        && isActiveRenderMesh(mesh.coordinate().key())
-                        && isInsideCurrentDrawFrustum(mesh.coordinate())
-                        && !isCoveredByCoarserMesh(mesh.coordinate()))
-                .sorted(Comparator.comparingDouble((LodSectionMesh mesh) -> distanceSquaredToCamera(mesh.coordinate(), camera)).reversed())
-                .toList();
-        if (waterMeshes.isEmpty()) {
+        if (visibleWaterMeshes.isEmpty()) {
             return;
         }
+        visibleWaterMeshes.sort(Comparator.comparingDouble((LodSectionMesh mesh) ->
+                distanceSquaredToCamera(mesh.coordinate(), camera)).reversed());
 
         if (blazeModelStore == null) {
             return;
         }
-        pass.setPipeline(renderLodAboveTerrain ? LOD_WATER_OVERLAY_PIPELINE : LOD_WATER_PIPELINE);
+        pass.setPipeline((renderLodAboveTerrain ? LOD_WATER_OVERLAY_PIPELINE : LOD_WATER_PIPELINE).get());
+        bindLodTables(pass);
         pass.setUniform("Fog", RenderSystem.getShaderFog());
         pass.bindTexture("Sampler0", blazeModelStore.atlasView(), blazeModelStore.atlasSampler());
         pass.bindTexture("Sampler2", Minecraft.getInstance().gameRenderer.levelLightmap(),
                 RenderSystem.getSamplerCache().getClampToEdge(FilterMode.LINEAR));
         pass.setIndexBuffer(lodIndexBuffer, IndexType.INT);
-        for (LodSectionMesh mesh : waterMeshes) {
-            pass.setVertexBuffer(0, mesh.waterVertexBuffer().slice());
-            pass.drawIndexed(indexCount(mesh.waterVertexCount()), 1, 0, 0, 0);
+        pass.setVertexBuffer(0, lodCornerBuffer.slice());
+        for (LodSectionMesh mesh : visibleWaterMeshes) {
+            pass.setUniform("VoxySection", mesh.sectionUniform());
+            pass.setVertexBuffer(1, mesh.waterInstances());
+            drawLodMesh(pass, mesh, true);
             lastWaterDrawCalls++;
-            lastWaterVertices += mesh.waterVertexCount();
+            lastWaterVertices += mesh.waterQuadCount() * LOD_VERTICES_PER_QUAD;
         }
     }
 
     private static long profileNow() {
-        return performanceProfiling ? System.nanoTime() : 0L;
+        return performanceProfiling || benchmark != null ? System.nanoTime() : 0L;
     }
 
     private static long profileElapsed(long start) {
@@ -1041,6 +1443,9 @@ public final class VoxyBlaze3DProbeRenderer {
     }
 
     public static void shutdown() {
+        if (benchmark != null) benchmark.endSession("renderer-shutdown");
+        benchmark = null;
+        benchmarkLevel = null;
         shutdownAsyncMesher();
         releaseBuffer(markerVertexBuffer, "marker");
         markerVertexBuffer = null;
@@ -1048,8 +1453,17 @@ public final class VoxyBlaze3DProbeRenderer {
         compositeVertexBuffer = null;
         releaseBuffer(lodIndexBuffer, "shared LoD index");
         lodIndexBuffer = null;
+        releaseBuffer(lodCornerBuffer, "shared LoD corners");
+        lodCornerBuffer = null;
         releaseBuffer(lodProjectionBuffer, "extended projection");
         lodProjectionBuffer = null;
+        lodLightingUniform = null; // Frame transient memory owns the underlying allocation.
+        sodiumMask.close();
+        gpuOcclusion.close();
+        gpuProfiler.close();
+        lastOccluderMeshes = 0;
+        lodOcclusionEnabled = false;
+        sodiumColumns = Blaze3dSodiumCoverage.empty();
         releaseBuffer(globalFogProjectionBuffer, "global fog projection");
         globalFogProjectionBuffer = null;
         releaseOffscreenTargets();
@@ -1063,7 +1477,7 @@ public final class VoxyBlaze3DProbeRenderer {
         voxyBiomes.clear();
         tintColors.clear();
         visibleVanillaSections.clear();
-        collectedVisibleVanillaSections.clear();
+        sodiumVisibility.clear();
         visibleVanillaMaskRevision = 0;
         initialized = false;
         failed = false;
@@ -1080,6 +1494,7 @@ public final class VoxyBlaze3DProbeRenderer {
         transitionBuildSections = List.of();
         transitionPendingChildren.clear();
         transitionParentKeys.clear();
+        bypassedIntermediateKeys.clear();
         clearTransitionReveals();
         transitionCoverageReadyKeys.clear();
         currentDrawFrustumValid = false;
@@ -1122,6 +1537,7 @@ public final class VoxyBlaze3DProbeRenderer {
         initializeLodIndexBuffer();
         initializeCompositeVertexBuffer();
         var deviceInfo = RenderSystem.getDevice().getDeviceInfo();
+        if (benchmark != null) recordBenchmarkDevice();
         Logger.info("Initializing Blaze3D probe: build=" + VoxyCommon.BUILD_ID
                 + ", buildNumber=" + VoxyCommon.BUILD_NUMBER
                 + ", backend=" + deviceInfo.backendName()
@@ -1131,12 +1547,12 @@ public final class VoxyBlaze3DProbeRenderer {
                 + ", multiDrawIndirect=" + deviceInfo.features().multiDrawIndirect()
                 + ", persistentMapping=" + deviceInfo.features().persistentMapping());
         Logger.info("Blaze3D LoD features: selector=exact-aabb-screen-area+five-plane-frustum, "
-                + "occlusion=offscreen-depth-reproject, traversal=incremental-cpu, handoff=per-octree-branch, draws=direct-indexed, "
+                + "occlusion=offscreen-depth-reproject, traversal=incremental-cpu, handoff=per-octree-branch, draws=instanced-quads, "
                 + "lighting=live-lightmap+directional, fog=voxy-environmental, vanilla-mask=section-visibility, "
                 + "opaque-order=after-sodium-cutout, farClip=" + Math.round(LOD_FAR_CLIP_BLOCKS)
                 + ", sodiumDistance=" + sodiumRenderDistanceChunks + " chunks.");
-        Logger.info("Blaze3D LoD geometry: vertexBytes=" + LOD_VERTEX_FORMAT.getVertexSize()
-                + ", verticesPerQuad=" + LOD_VERTICES_PER_QUAD
+        Logger.info("Blaze3D LoD geometry: bytesPerQuad=" + LOD_INSTANCE_FORMAT.getVertexSize()
+                + ", expansion=gpu"
                 + ", sharedIndexBuffer=" + formatBytes(LOD_INDEX_BUFFER_SIZE)
                 + ", retainedBudget=" + formatBytes(lodGeometryBudgetBytes)
                 + ", stagingBudget=" + formatBytes(lodStagingBudgetBytes)
@@ -1165,21 +1581,25 @@ public final class VoxyBlaze3DProbeRenderer {
     }
 
     private static void initializeLodIndexBuffer() {
-        if (lodIndexBuffer != null && !lodIndexBuffer.isClosed()) {
-            return;
+        if (LOD_INSTANCE_FORMAT.getVertexSize() != Blaze3dSectionMesh.QUAD_STRIDE) {
+            throw new IllegalStateException("Blaze3D quad instance layout mismatch");
         }
-
+        if (lodCornerBuffer == null || lodCornerBuffer.isClosed()) {
+            ByteBuffer corners = MemoryUtil.memAlloc(4 * 2 * Float.BYTES);
+            try {
+                corners.putFloat(0).putFloat(0).putFloat(0).putFloat(1)
+                        .putFloat(1).putFloat(0).putFloat(1).putFloat(1).flip();
+                lodCornerBuffer = RenderSystem.getDevice().createBuffer(
+                        () -> "Voxy Blaze3D shared quad corners",
+                        GpuBuffer.USAGE_VERTEX | GpuBuffer.USAGE_COPY_DST, corners);
+            } finally {
+                MemoryUtil.memFree(corners);
+            }
+        }
+        if (lodIndexBuffer != null && !lodIndexBuffer.isClosed()) return;
         ByteBuffer indices = MemoryUtil.memAlloc(LOD_INDEX_BUFFER_SIZE);
         try {
-            for (int quad = 0; quad < MAX_LOD_QUAD_COUNT_PER_SECTION; quad++) {
-                int baseVertex = quad * LOD_VERTICES_PER_QUAD;
-                indices.putInt(baseVertex + 1);
-                indices.putInt(baseVertex + 2);
-                indices.putInt(baseVertex);
-                indices.putInt(baseVertex + 1);
-                indices.putInt(baseVertex + 3);
-                indices.putInt(baseVertex + 2);
-            }
+            indices.putInt(1).putInt(2).putInt(0).putInt(1).putInt(3).putInt(2);
             indices.flip();
             lodIndexBuffer = RenderSystem.getDevice().createBuffer(
                     () -> "Voxy Blaze3D shared LoD index buffer",
@@ -1191,14 +1611,12 @@ public final class VoxyBlaze3DProbeRenderer {
     }
 
     private static void commitVisibleVanillaSectionMask() {
-        if (visibleVanillaSections.equals(collectedVisibleVanillaSections)) {
-            return;
-        }
-        visibleVanillaSections.clear();
-        visibleVanillaSections.addAll(collectedVisibleVanillaSections);
+        if (!sodiumVisibility.commitInto(visibleVanillaSections)) return;
+        Set<Long> columns = new HashSet<>();
+        for (long section : visibleVanillaSections) columns.add(Blaze3dSodiumCoverage.key(SectionPos.x(section), SectionPos.z(section)));
+        sodiumColumns = Blaze3dSodiumCoverage.of(columns);
         visibleVanillaMaskRevision++;
-        // The mask can change while Sodium performs visibility culling. The next normal refresh
-        // incorporates it; forcing an immediate rebuild here causes one full 32^3 LoD mesh per frame.
+        // Draw-time coverage changes immediately without rebuilding otherwise reusable Voxy geometry.
     }
 
     private static void uploadMarker(CommandEncoder encoder, CameraTransform camera) {
@@ -1227,6 +1645,7 @@ public final class VoxyBlaze3DProbeRenderer {
             transitionBuildSections = List.of();
             transitionPendingChildren.clear();
             transitionParentKeys.clear();
+            bypassedIntermediateKeys.clear();
             clearTransitionReveals();
             transitionCoverageReadyKeys.clear();
             lodSelectionTransitionPending = false;
@@ -1240,13 +1659,13 @@ public final class VoxyBlaze3DProbeRenderer {
         updateDynamicMemoryBudgets();
         ensureAsyncMesher(world, encoder);
         long meshUploadStart = profileNow();
-        drainPreparedLodMeshes(world);
+        drainPreparedLodMeshes();
         profiledMeshBuildNanos += profileElapsed(meshUploadStart);
         LodGridKey requestedGrid = createGridKey(camera);
         if (lodGridInvalidated || lodRenderGrid == null || !lodRenderGrid.key().equals(requestedGrid)) {
+            long gridStart = profileNow();
             boolean discardAllMeshes = lodGridInvalidated || lodRenderGrid == null
                     || lodRenderGrid.key().lodLevel() != requestedGrid.lodLevel()
-                    || lodRenderGrid.key().radius() != requestedGrid.radius()
                     || lodRenderGrid.key().minY() != requestedGrid.minY()
                     || lodRenderGrid.key().maxY() != requestedGrid.maxY();
             if (discardAllMeshes) {
@@ -1273,6 +1692,7 @@ public final class VoxyBlaze3DProbeRenderer {
                 transitionBuildSections = orderLodBuildsByRing(selectedLodSections);
                 transitionPendingChildren.clear();
                 transitionParentKeys.clear();
+                bypassedIntermediateKeys.clear();
                 clearTransitionReveals();
                 transitionCoverageReadyKeys.clear();
                 nextLodSectionRefresh = 0;
@@ -1286,6 +1706,7 @@ public final class VoxyBlaze3DProbeRenderer {
                     // travelling must not leave an uncovered ring until that traversal completes.
                     // Add only roots with no selected descendant; refined branches are preserved.
                     Set<Long> refinedParents = captureRefinedDrawAncestors(null);
+                    retainCoarseningCoverage(coveredSelection);
                     selectedLodSections = coveredSelection;
                     selectedLodSectionKeys = sectionKeys(coveredSelection);
                     prepareLodTransition(coveredSelection, refinedParents);
@@ -1304,6 +1725,9 @@ public final class VoxyBlaze3DProbeRenderer {
                     : rootCoverageExtended ? "preserved+root-coverage" : "preserved")
                     + ", selectedSections=" + selectedLodSections.size()
                     + ", distance=" + Math.round(VoxyConfig.CONFIG.sectionRenderDistance * 512.0f) + " blocks.");
+            benchmarkStage(Blaze3dBenchmark.Stage.GRID_SCAN, gridStart);
+            benchmarkEvent("GRID", "ns=" + profileElapsed(gridStart) + " roots=" + lodRenderGrid.sections().size()
+                    + " discard=" + discardAllMeshes + " selected=" + selectedLodSections.size());
         }
 
         int configuredSodiumDistance = sodiumRenderDistanceChunks > 0
@@ -1314,9 +1738,12 @@ public final class VoxyBlaze3DProbeRenderer {
         long selectionStart = profileNow();
         updateLodSelection(world, matrices, camera, viewportWidth, viewportHeight, activeVanillaBoundary);
         profiledSelectionNanos += profileElapsed(selectionStart);
+        benchmarkStage(Blaze3dBenchmark.Stage.SELECTION, selectionStart);
 
         if (renderGenerationService != null && frameCount >= lodUploadRetryFrame) {
-            refreshChangedLodSections(world);
+            long validationStart = profileNow();
+            refreshChangedLodSections();
+            benchmarkStage(Blaze3dBenchmark.Stage.VALIDATION, validationStart);
         }
         drainTransitionReveals();
 
@@ -1334,6 +1761,7 @@ public final class VoxyBlaze3DProbeRenderer {
             return;
         }
         if (initialPopulation) {
+            long schedulingStart = profileNow();
             long deadline = System.nanoTime() + LOD_VALIDATION_BUDGET_NANOS;
             int inspected = 0;
             while (nextLodSectionRefresh < transitionBuildSections.size()
@@ -1341,21 +1769,18 @@ public final class VoxyBlaze3DProbeRenderer {
                     && pendingMeshFingerprints.size() < MAX_ASYNC_MESHES
                     && hasStagingCapacity()) {
                 LodSectionCoordinate section = transitionBuildSections.get(nextLodSectionRefresh);
-                int ring = buildRing(section);
-                if (ring > activeBuildRing) {
-                    if (hasPendingWorkInBuildRing()) {
-                        int retry = firstIncompleteInBuildRing();
-                        if (retry >= 0) nextLodSectionRefresh = retry;
-                        break;
-                    }
-                    activeBuildRing = ring;
-                }
                 nextLodSectionRefresh++;
                 if (transitionCoverageReadyKeys.contains(section.key()) || !isActiveRenderMesh(section.key())) continue;
-                scheduleLodSection(world, section);
+                scheduleLodSection(section);
             }
+            benchmarkStage(Blaze3dBenchmark.Stage.SCHEDULING, schedulingStart);
+            if (pendingMeshFingerprints.size() >= MAX_ASYNC_MESHES) benchmarkCount(Blaze3dBenchmark.Counter.PENDING_LIMIT);
+            if (!hasStagingCapacity()) benchmarkCount(Blaze3dBenchmark.Counter.STAGING_LIMIT);
         }
         if (initialPopulation && nextLodSectionRefresh == transitionBuildSections.size()) {
+            // A stalled model, upload or memory retry in one branch must not stop retries in
+            // every other branch. Sweep the ordered frontier again on the next frame.
+            nextLodSectionRefresh = 0;
             if (!pendingMeshFingerprints.isEmpty() || !preparedLodMeshes.isEmpty()
                     || !transitionRevealQueue.isEmpty()) {
                 return;
@@ -1381,8 +1806,12 @@ public final class VoxyBlaze3DProbeRenderer {
 
     private static void ensureAsyncMesher(WorldEngine world, CommandEncoder encoder) {
         if (mesherWorld == world && renderGenerationService != null && modelBakery != null && blazeModelStore != null) {
+            long modelStart = profileNow();
             modelBakery.tick(0L);
+            benchmarkStage(Blaze3dBenchmark.Stage.MODEL_PUMP, modelStart);
+            long textureStart = profileNow();
             blazeModelStore.uploadPendingTextures(encoder);
+            benchmarkStage(Blaze3dBenchmark.Stage.TEXTURES, textureStart);
             return;
         }
         if (mesherWorld != null && mesherWorld != world) {
@@ -1399,6 +1828,7 @@ public final class VoxyBlaze3DProbeRenderer {
         }
 
         long generation = ++mesherGeneration;
+        benchmarkEvent("ATLAS_REQUEST", "generation=" + generation);
         atlasReadbackPending = true;
         pendingMesherWorld = world;
         world.acquireRef();
@@ -1429,6 +1859,7 @@ public final class VoxyBlaze3DProbeRenderer {
 
     private static void completeAtlasReadback(WorldEngine world, long generation, GpuBuffer readback,
                                               int width, int height) {
+        benchmarkEvent("ATLAS_CALLBACK", "generation=" + generation + " width=" + width + " height=" + height);
         int[] pixels = new int[width * height];
         RuntimeException readbackFailure = null;
         try (var mapped = readback.map(true, false)) {
@@ -1481,6 +1912,7 @@ public final class VoxyBlaze3DProbeRenderer {
         pendingMesherWorld = null;
         Blaze3dModelStore store = null;
         ModelBakerySubsystem bakery = null;
+        RenderGenerationService generationService = null;
         try {
             var instance = VoxyCommon.getInstance();
             if (instance == null) {
@@ -1503,17 +1935,28 @@ public final class VoxyBlaze3DProbeRenderer {
             }
             world.getMapper().setBiomeCallback(bakery::addBiome);
 
-            RenderGenerationService generationService = new RenderGenerationService(
+            generationService = new RenderGenerationService(
                     world, bakery, instance.getServiceManager(), false);
+            Blaze3dBenchmark session = benchmark;
+            if (session != null) generationService.setBuildObserver(session::buildAttempt);
             Blaze3dModelStore completedStore = store;
-            CardinalLighting completedLighting = Minecraft.getInstance().level.cardinalLighting();
             generationService.setResultConsumer(section -> acceptBuiltSection(
-                    section, generation, completedStore, completedLighting));
+                    section, generation, completedStore));
 
             blazeModelStore = store;
             modelBakery = bakery;
             renderGenerationService = generationService;
             mesherWorld = world;
+            world.acquireRef();
+            try {
+                fingerprintCache = new Blaze3dFingerprintCache(32768, 64,
+                        key -> computeNeighborhoodFingerprint(world, key, session),
+                        exception -> Logger.warn("Blaze3D revision lookup failed: " + exception), world::releaseRef);
+            } catch (RuntimeException | Error exception) {
+                world.releaseRef();
+                throw exception;
+            }
+            Blaze3dFingerprintCache revisions = fingerprintCache;
             Set<Long> changed = dirtyLodKeys;
             lodChangeListener = (section, flags, neighborMask) -> {
                 if (generation != mesherGeneration) return;
@@ -1524,16 +1967,27 @@ public final class VoxyBlaze3DProbeRenderer {
                         for (int dx = -1; dx <= 1; dx++) {
                             long key = WorldEngine.getWorldSectionId(section.lvl,
                                     section.x + dx, section.y + dy, section.z + dz);
+                            revisions.invalidate(key);
                             if (watched.contains(key)) changed.add(key);
                         }
                     }
                 }
             };
             world.addChangeListener(lodChangeListener);
+            benchmarkEvent("MESHER_READY", "generation=" + generation);
             Logger.info("Blaze3D LoD mesher now uses Cortex RenderDataFactory on Voxy service threads; "
                     + "configured shared workers=" + VoxyConfig.CONFIG.serviceThreads
                     + "; Blaze3D retains only atlas and vertex-buffer uploads on the render thread.");
         } catch (RuntimeException exception) {
+            if (lodChangeListener != null) world.removeChangeListener(lodChangeListener);
+            lodChangeListener = null;
+            if (fingerprintCache != null) { fingerprintCache.close(); fingerprintCache = null; }
+            if (generationService != null) generationService.shutdown();
+            renderGenerationService = null;
+            modelBakery = null;
+            blazeModelStore = null;
+            mesherWorld = null;
+            world.getMapper().setBiomeCallback(null);
             if (bakery != null) {
                 bakery.shutdown();
             } else if (store != null) {
@@ -1546,48 +2000,64 @@ public final class VoxyBlaze3DProbeRenderer {
     }
 
     private static void acceptBuiltSection(BuiltSection section, long generation,
-                                           Blaze3dModelStore store, CardinalLighting lighting) {
-        Long fingerprint = pendingMeshFingerprints.get(section.position);
-        if (generation != mesherGeneration || fingerprint == null || store != blazeModelStore) {
+                                           Blaze3dModelStore store) {
+        PendingLodMesh pending = pendingMeshFingerprints.get(section.position);
+        if (generation != mesherGeneration || pending == null || store != blazeModelStore) {
             section.free();
             return;
         }
+        long fingerprint = pending.fingerprint;
         long reservedBytes = 0L;
         boolean published = false;
         Blaze3dSectionMesh mesh = null;
+        Blaze3dBenchmark session = benchmark;
+        Blaze3dBenchmark.Request request = session == null ? null : session.request(section.position);
+        String rejected = "pack-failed";
         try {
             long totalQuads = section.isEmpty() ? 0L : section.geometryBuffer.size / Long.BYTES;
             int translucentQuads = section.isEmpty() ? 0 : section.offsets[1] - section.offsets[0];
             if (translucentQuads > MAX_LOD_QUAD_COUNT_PER_SECTION
                     || totalQuads - translucentQuads > MAX_LOD_QUAD_COUNT_PER_SECTION) {
-                throw new IllegalStateException("Cortex section exceeds the Blaze3D shared index buffer: "
+                throw new IllegalStateException("Cortex section exceeds the Blaze3D quad safety limit: "
                         + WorldEngine.pprintPos(section.position));
             }
-            long bytes = totalQuads * LOD_VERTICES_PER_QUAD * LOD_VERTEX_FORMAT.getVertexSize();
-            // Reserve before expansion so simultaneous workers cannot overrun CPU staging.
-            if (!reserveStagingBytes(bytes)) return;
+            long bytes = Blaze3dQuadEncoder.bytes(Math.toIntExact(totalQuads));
+            // Reserve before packing so simultaneous workers cannot overrun CPU staging.
+            if (!reserveStagingBytes(bytes)) {
+                if (session != null) session.count(Blaze3dBenchmark.Counter.STAGING_LIMIT);
+                rejected = "staging-limit";
+                return;
+            }
             reservedBytes = bytes;
-            mesh = Blaze3dSectionMesh.expand(section, store, lighting);
+            long packStart = session == null ? 0L : System.nanoTime();
+            mesh = Blaze3dSectionMesh.pack(section, store);
+            if (session != null) session.prepared(request, System.nanoTime() - packStart);
             PreparedLodMesh prepared = new PreparedLodMesh(
-                    fingerprint, mesh.requiredTextureVersion(), bytes, mesh);
+                    fingerprint, mesh.requiredTextureVersion(), bytes, mesh, session, request, pending);
             preparedLodMeshes.add(prepared);
             published = true;
             if (generation != mesherGeneration || store != blazeModelStore
-                    || !fingerprint.equals(pendingMeshFingerprints.get(section.position))) {
+                    || pendingMeshFingerprints.get(section.position) != pending) {
                 if (preparedLodMeshes.remove(prepared)) {
                     preparedLodMeshBytes.addAndGet(-bytes);
                     mesh.close();
                 }
-                pendingMeshFingerprints.remove(section.position, fingerprint);
+                pendingMeshFingerprints.remove(section.position, pending);
+                if (session != null) session.finished(request, "generation-changed", bytes);
             }
         } catch (RuntimeException | OutOfMemoryError exception) {
-            Logger.error("Failed to expand Cortex LoD geometry for Blaze3D at "
+            if (session != null) {
+                session.count(Blaze3dBenchmark.Counter.PACK_FAILED);
+                session.event("ERROR", "pack key=" + section.position + " exception=" + exception);
+            }
+            Logger.error("Failed to pack Cortex LoD geometry for Blaze3D at "
                     + WorldEngine.pprintPos(section.position) + ".", exception);
         } finally {
             if (!published) {
                 if (mesh != null) mesh.close();
                 preparedLodMeshBytes.addAndGet(-reservedBytes);
-                pendingMeshFingerprints.remove(section.position, fingerprint);
+                pendingMeshFingerprints.remove(section.position, pending);
+                if (session != null) session.finished(request, rejected, reservedBytes);
             }
             section.free();
         }
@@ -1602,11 +2072,16 @@ public final class VoxyBlaze3DProbeRenderer {
         return true;
     }
 
-    private static void drainPreparedLodMeshes(WorldEngine world) {
+    private static void drainPreparedLodMeshes() {
         lastFrameUploadBytes = 0L;
         lastFrameUploadCount = 0;
+        lastFrameUploadNanos = 0L;
+        lastFrameBufferCreateNanos = 0L;
         if (frameCount < lodUploadRetryFrame) return;
+        long uploadStart = System.nanoTime();
         int uploadLimit = getLodUploadsPerFrame();
+        Blaze3dLodStreaming.UploadBudget uploadBudget = new Blaze3dLodStreaming.UploadBudget(
+                uploadLimit, LOD_UPLOAD_BUDGET_BYTES, LOD_UPLOAD_BUDGET_NANOS, uploadStart);
         int uploaded = 0;
         int inspected = 0;
         int readyAtStart = preparedLodMeshes.size();
@@ -1620,7 +2095,7 @@ public final class VoxyBlaze3DProbeRenderer {
         }
         ready.sort(Comparator.comparingInt((PreparedLodMesh prepared) -> {
             long key = prepared.mesh().position();
-            return buildRing(new LodSectionCoordinate(key, WorldEngine.getX(key), WorldEngine.getY(key), WorldEngine.getZ(key)));
+            return buildPriority(new LodSectionCoordinate(key, WorldEngine.getX(key), WorldEngine.getY(key), WorldEngine.getZ(key)));
         }).thenComparingInt(prepared -> -WorldEngine.getLevel(prepared.mesh().position())));
         for (int index = ready.size() - 1; index >= 0; index--) preparedLodMeshes.addFirst(ready.get(index));
         PreparedLodMesh prepared;
@@ -1628,49 +2103,64 @@ public final class VoxyBlaze3DProbeRenderer {
                 && inspected++ < readyAtStart
                 && (prepared = preparedLodMeshes.poll()) != null) {
             if (!isActiveRenderMesh(prepared.mesh().position())) {
+                benchmarkCount(Blaze3dBenchmark.Counter.INACTIVE);
+                prepared.finished("inactive-cached", prepared.geometryBytes());
                 cachePreparedLodMesh(prepared);
                 preparedLodMeshBytes.addAndGet(-prepared.geometryBytes());
-                pendingMeshFingerprints.remove(prepared.mesh().position(), prepared.fingerprint());
-                continue;
-            }
-            long preparedKey = prepared.mesh().position();
-            if (lodSelectionTransitionPending && buildRing(new LodSectionCoordinate(preparedKey,
-                    WorldEngine.getX(preparedKey), WorldEngine.getY(preparedKey), WorldEngine.getZ(preparedKey))) > activeBuildRing) {
-                // Do not leave far work occupying all staging/pending slots while a nearer ring
-                // needs workers. The RAM cache owns it until that ring is allowed to proceed.
-                cachePreparedLodMesh(prepared);
-                preparedLodMeshBytes.addAndGet(-prepared.geometryBytes());
-                pendingMeshFingerprints.remove(preparedKey, prepared.fingerprint());
+                pendingMeshFingerprints.remove(prepared.mesh().position(), prepared.pending());
                 continue;
             }
             if (blazeModelStore == null || !blazeModelStore.isTextureVersionUploaded(prepared.textureVersion())) {
+                benchmarkCount(Blaze3dBenchmark.Counter.TEXTURE_WAIT);
                 preparedLodMeshes.add(prepared);
                 continue;
             }
+            if (!uploadBudget.canUpload(prepared.geometryBytes(), System.nanoTime())) {
+                benchmarkCount(Blaze3dBenchmark.Counter.UPLOAD_LIMIT);
+                preparedLodMeshes.addFirst(prepared);
+                break;
+            }
+            Long currentFingerprint = fingerprintCache == null ? null : fingerprintCache.request(prepared.mesh().position());
+            if (currentFingerprint == null) {
+                benchmarkCount(Blaze3dBenchmark.Counter.FINGERPRINT_WAIT);
+                preparedLodMeshes.add(prepared);
+                continue;
+            }
+            boolean applied;
             try {
-                applyPreparedLodMesh(world, prepared.fingerprint(), prepared.mesh());
+                applied = applyPreparedLodMesh(currentFingerprint, prepared);
             } finally {
+                prepared.finished("apply-aborted", prepared.geometryBytes());
                 cachePreparedLodMesh(prepared);
                 preparedLodMeshBytes.addAndGet(-prepared.geometryBytes());
-                pendingMeshFingerprints.remove(prepared.mesh().position(), prepared.fingerprint());
+                pendingMeshFingerprints.remove(prepared.mesh().position(), prepared.pending());
             }
+            uploadBudget.record(prepared.geometryBytes());
             uploaded++;
-            lastFrameUploadCount = uploaded;
-            lastFrameUploadBytes += prepared.geometryBytes();
+            if (applied) {
+                lastFrameUploadCount++;
+                lastFrameUploadBytes += prepared.geometryBytes();
+            }
             if (frameCount < lodUploadRetryFrame) break;
         }
+        lastFrameUploadNanos = System.nanoTime() - uploadStart;
+        if (uploaded >= uploadLimit && !preparedLodMeshes.isEmpty()) benchmarkCount(Blaze3dBenchmark.Counter.UPLOAD_LIMIT);
+        benchmarkStage(Blaze3dBenchmark.Stage.UPLOAD_DRAIN, uploadStart);
     }
 
-    private static void applyPreparedLodMesh(WorldEngine world, long fingerprint, Blaze3dSectionMesh mesh) {
+    private static boolean applyPreparedLodMesh(long currentFingerprint, PreparedLodMesh prepared) {
+        long fingerprint = prepared.fingerprint();
+        Blaze3dSectionMesh mesh = prepared.mesh();
         long key = mesh.position();
         if (!selectedLodSectionKeys.contains(key) && !transitionParentKeys.contains(key)) {
-            return;
+            benchmarkCount(Blaze3dBenchmark.Counter.INACTIVE);
+            prepared.finished("inactive", mesh.geometryBytes());
+            return false;
         }
-        int level = WorldEngine.getLevel(key);
-        long currentFingerprint = getNeighborhoodFingerprint(
-                world, level, WorldEngine.getX(key), WorldEngine.getY(key), WorldEngine.getZ(key));
         if (currentFingerprint != fingerprint) {
-            return;
+            benchmarkCount(Blaze3dBenchmark.Counter.STALE);
+            prepared.finished("stale", mesh.geometryBytes());
+            return false;
         }
 
         LodSectionCoordinate coordinate = new LodSectionCoordinate(
@@ -1681,8 +2171,10 @@ public final class VoxyBlaze3DProbeRenderer {
             updateGeometryBudgetState();
             removeLodMesh(key);
             lodMeshFingerprints.put(key, fingerprint);
+            coarseningCoverage.ready(key);
             if (lodSelectionTransitionPending) markTransitionCoverageReady(key);
-            return;
+            prepared.finished("confirmed-empty", 0);
+            return true;
         }
 
         long requestedGeometryBytes = geometryBytes(mesh.opaqueQuadCount(), mesh.translucentQuadCount());
@@ -1702,30 +2194,22 @@ public final class VoxyBlaze3DProbeRenderer {
                         + formatBytes(requestedGeometryBytes) + " for " + WorldEngine.pprintPos(key) + ".");
             }
             requestCoarserLodSelectionForBudget();
-            return;
+            benchmarkCount(Blaze3dBenchmark.Counter.MEMORY_REJECTED);
+            prepared.finished("geometry-budget", requestedGeometryBytes);
+            return false;
         }
 
         budgetDeferredMeshes.remove(key);
         updateGeometryBudgetState();
 
-        GpuBuffer opaque = null;
-        GpuBuffer translucent = null;
+        GpuBuffer instances = null;
+        long allocationStart = System.nanoTime();
         try {
-            if (mesh.opaqueVertices() != null) {
-                opaque = RenderSystem.getDevice().createBuffer(
-                        () -> "Voxy Blaze3D Cortex opaque " + WorldEngine.pprintPos(key),
-                        GpuBuffer.USAGE_VERTEX | GpuBuffer.USAGE_COPY_DST,
-                        mesh.opaqueVertices().duplicate());
-            }
-            if (mesh.translucentVertices() != null) {
-                translucent = RenderSystem.getDevice().createBuffer(
-                        () -> "Voxy Blaze3D Cortex translucent " + WorldEngine.pprintPos(key),
-                        GpuBuffer.USAGE_VERTEX | GpuBuffer.USAGE_COPY_DST,
-                        mesh.translucentVertices().duplicate());
-            }
+            instances = RenderSystem.getDevice().createBuffer(
+                    () -> "Voxy Blaze3D Cortex quad instances " + WorldEngine.pprintPos(key),
+                    GpuBuffer.USAGE_VERTEX | GpuBuffer.USAGE_UNIFORM | GpuBuffer.USAGE_COPY_DST, mesh.instances().duplicate());
         } catch (RuntimeException | OutOfMemoryError exception) {
-            releaseLodMeshBuffer(opaque, key);
-            releaseLodMeshBuffer(translucent, key);
+            releaseLodMeshBuffer(instances, key);
             lodAllocationFailures++;
             lodAllocationGeometryLimit = Math.max(64L * 1024L * 1024L,
                     Math.min(lodAllocationGeometryLimit, lodGeometryBudgetBytes * 3L / 4L));
@@ -1737,41 +2221,71 @@ public final class VoxyBlaze3DProbeRenderer {
             requestCoarserLodSelectionForBudget();
             Logger.error("Blaze3D mesh allocation failed; retaining previous coverage and retrying with "
                     + formatBytes(lodGeometryBudgetBytes) + " geometry budget.", exception);
-            return;
+            benchmarkCount(Blaze3dBenchmark.Counter.ALLOCATION_FAILED);
+            prepared.finished("allocation-failed", requestedGeometryBytes);
+            return false;
+        } finally {
+            lastFrameBufferCreateNanos += System.nanoTime() - allocationStart;
+            benchmarkStage(Blaze3dBenchmark.Stage.BUFFER_CREATE, allocationStart);
         }
         // Both generations coexist until replaceLodMesh closes the previous buffers.
         peakLodGeometryBytes = Math.max(peakLodGeometryBytes, lodGeometryBytes + requestedGeometryBytes);
-        replaceLodMesh(coordinate,
-                opaque, mesh.opaqueQuadCount() * LOD_VERTICES_PER_QUAD,
-                translucent, mesh.translucentQuadCount() * LOD_VERTICES_PER_QUAD);
+        replaceLodMesh(coordinate, instances, mesh.opaqueQuadCount(), mesh.translucentQuadCount(), mesh.aabb());
         lodMeshUploads++;
         lodMeshFingerprints.put(key, fingerprint);
+        coarseningCoverage.ready(key);
         if (lodSelectionTransitionPending) markTransitionCoverageReady(key);
+        prepared.finished("uploaded", requestedGeometryBytes);
+        return true;
     }
 
-    private static void scheduleLodSection(WorldEngine world, LodSectionCoordinate coordinate) {
-        if (lodSelectionTransitionPending && buildRing(coordinate) > activeBuildRing) return;
-        if (pendingMeshFingerprints.containsKey(coordinate.key())
-                || pendingMeshFingerprints.size() >= MAX_ASYNC_MESHES || !hasStagingCapacity()) return;
+    private static boolean scheduleLodSection(LodSectionCoordinate coordinate) {
+        if (!selectedLodSectionKeys.contains(coordinate.key())
+                && Blaze3dLodStreaming.skipIntermediate(WorldEngine.getLevel(coordinate.key()),
+                WorldEngine.MAX_LOD_LAYER, false,
+                lodMeshFingerprints.containsKey(coordinate.key()), transitionCoverageReadyKeys.contains(coordinate.key()))) {
+            bypassedIntermediateKeys.add(coordinate.key());
+            benchmarkCount(Blaze3dBenchmark.Counter.BYPASSED);
+            return true;
+        }
+        bypassedIntermediateKeys.remove(coordinate.key());
+        if (pendingMeshFingerprints.containsKey(coordinate.key())) {
+            benchmarkCount(Blaze3dBenchmark.Counter.ALREADY_PENDING);
+            return true;
+        }
+        if (pendingMeshFingerprints.size() >= MAX_ASYNC_MESHES) {
+            benchmarkCount(Blaze3dBenchmark.Counter.PENDING_LIMIT);
+            return true;
+        }
+        if (!hasStagingCapacity()) {
+            benchmarkCount(Blaze3dBenchmark.Counter.STAGING_LIMIT);
+            return true;
+        }
         lodMeshBuildAttempts++;
         int lodLevel = WorldEngine.getLevel(coordinate.key());
-        long fingerprint = getNeighborhoodFingerprint(
-                world, lodLevel, coordinate.x(), coordinate.y(), coordinate.z());
+        Long readyFingerprint = fingerprintCache == null ? null : fingerprintCache.request(coordinate.key());
+        if (readyFingerprint == null) {
+            benchmarkCount(Blaze3dBenchmark.Counter.FINGERPRINT_WAIT);
+            return false;
+        }
+        long fingerprint = readyFingerprint;
         if (fingerprint == Long.MIN_VALUE) {
             lodMeshMissingSections++;
             budgetDeferredMeshes.remove(coordinate.key());
             updateGeometryBudgetState();
-            removeLodMesh(coordinate.key());
+            // Temporarily unavailable world data is not an empty mesh. Keep any previously
+            // confirmed geometry until a new result can replace it, including during imports.
             removeCachedLodMesh(coordinate.key());
-            lodMeshFingerprints.remove(coordinate.key());
             unavailableLodSections.add(coordinate.key());
-            return;
+            benchmarkCount(Blaze3dBenchmark.Counter.MISSING);
+            return true;
         }
         unavailableLodSections.remove(coordinate.key());
         if (Long.valueOf(fingerprint).equals(lodMeshFingerprints.get(coordinate.key()))) {
             lodMeshUnchanged++;
+            benchmarkCount(Blaze3dBenchmark.Counter.UNCHANGED);
             if (lodSelectionTransitionPending) markTransitionCoverageReady(coordinate.key());
-            return;
+            return true;
         }
         BudgetDeferredMesh deferred = budgetDeferredMeshes.get(coordinate.key());
         if (deferred != null) {
@@ -1779,13 +2293,13 @@ public final class VoxyBlaze3DProbeRenderer {
                 budgetDeferredMeshes.remove(coordinate.key());
                 updateGeometryBudgetState();
             } else {
-                if (frameCount < deferred.retryFrame()) return;
+                if (frameCount < deferred.retryFrame()) return true;
                 evictInactiveCachedGeometry(deferred.geometryBytes(), coordinate.key());
                 if (!hasGeometryCapacity(coordinate.key(), deferred.geometryBytes())) {
                     budgetDeferredMeshes.put(coordinate.key(), new BudgetDeferredMesh(fingerprint,
                             deferred.geometryBytes(), frameCount + LOD_MEMORY_RETRY_FRAMES));
                     requestCoarserLodSelectionForBudget();
-                    return;
+                    return true;
                 }
                 budgetDeferredMeshes.remove(coordinate.key());
                 updateGeometryBudgetState();
@@ -1796,22 +2310,31 @@ public final class VoxyBlaze3DProbeRenderer {
             removeCachedLodMesh(coordinate.key());
             cached = null;
         }
-        if (pendingMeshFingerprints.putIfAbsent(coordinate.key(), fingerprint) == null) {
+        PendingLodMesh pending = new PendingLodMesh(fingerprint);
+        if (pendingMeshFingerprints.putIfAbsent(coordinate.key(), pending) == null) {
             if (cached != null) {
                 PreparedLodMesh prepared = cached.prepared();
                 if (!reserveStagingBytes(prepared.geometryBytes())) {
-                    pendingMeshFingerprints.remove(coordinate.key(), fingerprint);
-                    return;
+                    pendingMeshFingerprints.remove(coordinate.key(), pending);
+                    return true;
                 }
-                // Transfer ownership without copying or expanding the geometry again.
+                // Transfer ownership without copying or packing the geometry again.
                 cachedLodMeshes.remove(coordinate.key());
                 cachedLodMeshBytes -= prepared.geometryBytes();
-                preparedLodMeshes.add(prepared);
+                Blaze3dBenchmark session = benchmark;
+                Blaze3dBenchmark.Request request = session == null ? null : session.requested(coordinate.key(),
+                        lodLevel, buildRing(coordinate),
+                        horizontalSectionDistance(coordinate, currentDrawCameraX, currentDrawCameraZ), true);
+                preparedLodMeshes.add(new PreparedLodMesh(prepared.fingerprint(), prepared.textureVersion(),
+                        prepared.geometryBytes(), prepared.mesh(), session, request, pending));
                 lodMeshCacheHits++;
             } else {
-                renderGenerationService.enqueueTask(coordinate.key());
+                if (benchmark != null) benchmark.requested(coordinate.key(), lodLevel, buildRing(coordinate),
+                        horizontalSectionDistance(coordinate, currentDrawCameraX, currentDrawCameraZ), false);
+                renderGenerationService.enqueueTask(coordinate.key(), buildPriority(coordinate));
             }
         }
+        return true;
     }
 
     private static void cachePreparedLodMesh(PreparedLodMesh prepared) {
@@ -1821,27 +2344,17 @@ public final class VoxyBlaze3DProbeRenderer {
             prepared.mesh().close();
             return;
         }
-        cachedLodMeshes.put(key, new CachedLodMesh(prepared, frameCount));
+        cachedLodMeshes.put(key, new CachedLodMesh(new PreparedLodMesh(prepared.fingerprint(),
+                prepared.textureVersion(), prepared.geometryBytes(), prepared.mesh(), null, null, null)));
         cachedLodMeshBytes += prepared.geometryBytes();
-        while (cachedLodMeshBytes > lodMeshCacheBudgetBytes) {
-            // Include the incoming mesh in the candidates: distant zoom results must not displace
-            // nearby terrain just because they were uploaded more recently.
-            CachedLodMesh victim = null;
-            double farthest = -1.0;
-            for (CachedLodMesh candidate : cachedLodMeshes.values()) {
-                long position = candidate.prepared().mesh().position();
-                LodSectionCoordinate coordinate = new LodSectionCoordinate(position,
-                        WorldEngine.getX(position), WorldEngine.getY(position), WorldEngine.getZ(position));
-                double distance = distanceSquaredToCamera(coordinate,
-                        currentDrawCameraX, currentDrawCameraY, currentDrawCameraZ);
-                if (victim == null || distance > farthest
-                        || (distance == farthest && candidate.usedFrame() < victim.usedFrame())) {
-                    victim = candidate;
-                    farthest = distance;
-                }
-            }
-            if (victim == null) break;
-            removeCachedLodMesh(victim.prepared().mesh().position());
+        // Access-order LRU: cache hits keep useful geometry warm without a full spatial
+        // scan of a multi-gigabyte cache for every uploaded section. GPU coverage is independent.
+        var oldest = cachedLodMeshes.entrySet().iterator();
+        while (cachedLodMeshBytes > lodMeshCacheBudgetBytes && oldest.hasNext()) {
+            CachedLodMesh evicted = oldest.next().getValue();
+            oldest.remove();
+            cachedLodMeshBytes -= evicted.prepared().geometryBytes();
+            evicted.prepared().mesh().close();
         }
     }
 
@@ -1859,10 +2372,10 @@ public final class VoxyBlaze3DProbeRenderer {
         cachedLodMeshBytes = 0L;
     }
 
-    private record CachedLodMesh(PreparedLodMesh prepared, long usedFrame) {
+    private record CachedLodMesh(PreparedLodMesh prepared) {
     }
 
-    private static void refreshChangedLodSections(WorldEngine world) {
+    private static void refreshChangedLodSections() {
         if (watchedLodKeys.isEmpty() && !selectedLodSectionKeys.isEmpty()) {
             watchedLodKeys = Set.copyOf(selectedLodSectionKeys);
         }
@@ -1877,19 +2390,20 @@ public final class VoxyBlaze3DProbeRenderer {
             // Remove before fingerprinting: a concurrent edit must be able to enqueue again.
             dirty.remove();
             if (isActiveRenderMesh(key)) {
-                scheduleLodSection(world, new LodSectionCoordinate(key,
-                        WorldEngine.getX(key), WorldEngine.getY(key), WorldEngine.getZ(key)));
+                if (!scheduleLodSection(new LodSectionCoordinate(key,
+                        WorldEngine.getX(key), WorldEngine.getY(key), WorldEngine.getZ(key)))) dirtyLodKeys.add(key);
             }
         }
-        // Bounded fallback also retries missing leaves during an unfinished transition.
-        for (int count = 0; count < LOD_VALIDATIONS_PER_FRAME && !selectedLodSections.isEmpty()
+        // Dirty notifications remain the primary path. Idle checks reuse cached fingerprints;
+        // cache misses and invalidated neighbourhoods are read by the revision worker.
+        for (int count = 0; count < LOD_IDLE_VALIDATIONS_PER_FRAME && !selectedLodSections.isEmpty()
                 && System.nanoTime() < deadline && pendingMeshFingerprints.size() < MAX_ASYNC_MESHES
                 && hasStagingCapacity(); count++) {
             nextLodSectionValidation %= selectedLodSections.size();
             LodSectionCoordinate section = selectedLodSections.get(nextLodSectionValidation);
             // Initial construction keeps parent/frontier priority; existing sections still update.
             if (!lodSelectionTransitionPending || lodMeshFingerprints.containsKey(section.key())) {
-                scheduleLodSection(world, section);
+                scheduleLodSection(section);
             }
             nextLodSectionValidation = (nextLodSectionValidation + 1) % selectedLodSections.size();
         }
@@ -1905,6 +2419,10 @@ public final class VoxyBlaze3DProbeRenderer {
             mesherWorld.removeChangeListener(lodChangeListener);
         }
         lodChangeListener = null;
+        if (fingerprintCache != null) {
+            fingerprintCache.close();
+            fingerprintCache = null;
+        }
         dirtyLodKeys.clear();
         if (mesherWorld == null && pendingMesherWorld == null && renderGenerationService == null
                 && modelBakery == null && blazeModelStore == null && pendingMeshFingerprints.isEmpty()
@@ -1935,6 +2453,9 @@ public final class VoxyBlaze3DProbeRenderer {
             prepared.mesh().close();
         }
         preparedLodMeshBytes.set(0L);
+        if (benchmark != null) {
+            for (long key : pendingMeshFingerprints.keySet()) benchmarkFinished(key, "mesher-reset", 0);
+        }
         pendingMeshFingerprints.clear();
         budgetDeferredMeshes.clear();
         updateGeometryBudgetState();
@@ -1944,7 +2465,17 @@ public final class VoxyBlaze3DProbeRenderer {
         }
     }
 
-    private record PreparedLodMesh(long fingerprint, long textureVersion, long geometryBytes, Blaze3dSectionMesh mesh) {
+    // Object identity also protects a successor whose world fingerprint happens to be equal.
+    private static final class PendingLodMesh {
+        final long fingerprint;
+        PendingLodMesh(long fingerprint) { this.fingerprint = fingerprint; }
+    }
+
+    private record PreparedLodMesh(long fingerprint, long textureVersion, long geometryBytes, Blaze3dSectionMesh mesh,
+                                   Blaze3dBenchmark session, Blaze3dBenchmark.Request request, PendingLodMesh pending) {
+        void finished(String outcome, long bytes) {
+            if (this.session != null) this.session.finished(this.request, outcome, bytes);
+        }
     }
 
     private record BudgetDeferredMesh(long fingerprint, long geometryBytes, long retryFrame) {
@@ -2024,6 +2555,7 @@ public final class VoxyBlaze3DProbeRenderer {
                 // Publish the previous hierarchy immediately; the normal-FOV traversal can
                 // update it afterwards. Nearby meshes do not wait for meshing or GPU uploads.
                 Set<Long> refinedParents = captureRefinedDrawAncestors(null);
+                retainCoarseningCoverage(preZoomSelection);
                 selectedLodSections = preZoomSelection;
                 selectedLodSectionKeys = sectionKeys(selectedLodSections);
                 prepareLodTransition(selectedLodSections, refinedParents);
@@ -2077,9 +2609,11 @@ public final class VoxyBlaze3DProbeRenderer {
         boolean retainLocalDetail = !lodBudgetBackoffPending
                 && lastSubdivisionSize == VoxyConfig.CONFIG.subDivisionSize
                 && lastLodSelectionMinimumLevel == minimumLodLevel;
+        long hierarchyStart = profileNow();
         boolean hierarchyAvailable = lastLodSelectionFrame != Long.MIN_VALUE
                 && pollHierarchyAvailability(world, viewProjection, camera,
                 viewportWidth, viewportHeight, vanillaBoundary);
+        benchmarkStage(Blaze3dBenchmark.Stage.HIERARCHY, hierarchyStart);
         String invalidationReason = hierarchyAvailable ? "hierarchy-available" : "initial";
         if (lastLodSelectionFrame != Long.MIN_VALUE) {
             double dx = camera.x - lastLodSelectionX;
@@ -2178,12 +2712,14 @@ public final class VoxyBlaze3DProbeRenderer {
         boolean complete = selection.pending().isEmpty();
         int completedRing = complete ? WorldEngine.MAX_LOD_LAYER
                 : lodRing(selection.pending().peek(), selection.cameraX(), selection.cameraZ(), selection.ringWidth) - 1;
-        if (!complete && completedRing <= selection.publishedRing) return;
+        if (!complete && completedRing <= selection.publishedRing
+                && frameCount - selection.lastPublishedFrame < LOD_SELECTION_PUBLISH_INTERVAL_FRAMES) return;
+        selection.lastPublishedFrame = frameCount;
         selection.publishedRing = completedRing;
         List<LodSectionCoordinate> frontier = new ArrayList<>(selection.selected());
         if (!complete) {
-            // Publish completed near rings immediately. Preserve the previous detail in branches
-            // still waiting for traversal; queued coarse nodes must not undo the existing scene.
+            // Publish completed rings immediately, or a bounded partial frontier while a large
+            // ring is still traversing. Preserve previous detail in unfinished branches.
             for (LodSectionCoordinate waiting : selection.pending()) {
                 List<LodSectionCoordinate> previous = selection.previousDescendants.get(waiting.key());
                 if (previous == null || previous.isEmpty()) frontier.add(waiting);
@@ -2196,7 +2732,8 @@ public final class VoxyBlaze3DProbeRenderer {
         List<LodSectionCoordinate> selected = List.copyOf(frontier);
         lastSelectionFrustumCulledNodes = selection.frustumCulledNodes;
         lastSelectionScreenTestedNodes = selection.screenTestedNodes;
-        lastSelectionReason = selection.invalidationReason() + (complete ? "" : "+ring-" + completedRing);
+        lastSelectionReason = selection.invalidationReason()
+                + (complete ? "" : completedRing < 0 ? "+frontier" : "+ring-" + completedRing);
         publishedLodViewProjection = new Matrix4f(selection.viewProjection());
         publishedLodCameraX = selection.cameraX();
         publishedLodCameraY = selection.cameraY();
@@ -2211,9 +2748,13 @@ public final class VoxyBlaze3DProbeRenderer {
         Set<Long> selectedKeys = sectionKeys(selected);
         boolean topologyChanged = !selectedKeys.equals(selectedLodSectionKeys);
         boolean priorityChanged = !selected.equals(selectedLodSections);
+        benchmarkEvent("SELECTION_PUBLISHED", "frame=" + frameCount + " startedFrame=" + selection.startedFrame()
+                + " reason=" + lastSelectionReason + " complete=" + complete + " processed=" + selection.processedNodes
+                + " pending=" + selection.pending().size() + " selected=" + selected.size() + " topologyChanged=" + topologyChanged);
         if (topologyChanged) {
             lodTopologyChanges++;
             Set<Long> refinedParents = captureRefinedDrawAncestors(null);
+            retainCoarseningCoverage(selected);
             selectedLodSections = selected;
             selectedLodSectionKeys = selectedKeys;
             prepareLodTransition(selected, refinedParents);
@@ -2276,7 +2817,8 @@ public final class VoxyBlaze3DProbeRenderer {
                 new ArrayList<>(), frameCount, "hierarchy-probe");
         int sectionCount = selectedLodSections.size();
         int checks = Math.min(sectionCount, LOD_HIERARCHY_RECHECKS_PER_FRAME);
-        for (int checked = 0; checked < checks; checked++) {
+        long deadline = System.nanoTime() + 500_000L;
+        for (int checked = 0; checked < checks && System.nanoTime() < deadline; checked++) {
             if (nextLodHierarchyRecheck >= sectionCount) {
                 nextLodHierarchyRecheck = 0;
             }
@@ -2300,7 +2842,7 @@ public final class VoxyBlaze3DProbeRenderer {
     }
 
     private static boolean hasAvailableChildHierarchy(WorldEngine world, LodSectionCoordinate coordinate) {
-        WorldSection section = world.acquireIfExists(coordinate.key());
+        WorldSection section = benchmarkAcquire(world, coordinate.key());
         if (section == null) {
             return false;
         }
@@ -2326,7 +2868,7 @@ public final class VoxyBlaze3DProbeRenderer {
                             coordinate.x() * 2 + childX,
                             coordinate.y() * 2 + childY,
                             coordinate.z() * 2 + childZ);
-                    WorldSection child = world.acquireIfExists(childKey);
+                    WorldSection child = benchmarkAcquire(world, childKey);
                     if (child == null) {
                         return false;
                     }
@@ -2340,7 +2882,7 @@ public final class VoxyBlaze3DProbeRenderer {
     private static void selectLodSection(LodSelectionTask selection, LodSectionCoordinate coordinate) {
         WorldEngine world = selection.world();
         int lodLevel = WorldEngine.getLevel(coordinate.key());
-        WorldSection section = world.acquireIfExists(coordinate.key());
+        WorldSection section = benchmarkAcquire(world, coordinate.key());
         if (section == null) {
             return;
         }
@@ -2396,7 +2938,7 @@ public final class VoxyBlaze3DProbeRenderer {
                     int childSectionY = coordinate.y() * 2 + childY;
                     int childSectionZ = coordinate.z() * 2 + childZ;
                     long childKey = WorldEngine.getWorldSectionId(childLevel, childSectionX, childSectionY, childSectionZ);
-                    WorldSection child = world.acquireIfExists(childKey);
+                    WorldSection child = benchmarkAcquire(world, childKey);
                     if (child == null) {
                         hasMissingChild = true;
                         continue;
@@ -2430,12 +2972,7 @@ public final class VoxyBlaze3DProbeRenderer {
 
     private static int lodRing(LodSectionCoordinate coordinate, double cameraX, double cameraZ, double width) {
         double distance = horizontalSectionDistance(coordinate, cameraX, cameraZ);
-        int ring = 0;
-        while (ring < WorldEngine.MAX_LOD_LAYER && distance >= width) {
-            ring++;
-            width *= 2.0;
-        }
-        return ring;
+        return Blaze3dLodStreaming.selectionRing(distance, width, WorldEngine.MAX_LOD_LAYER);
     }
 
     private static void enqueueSelectionNodes(LodSelectionTask selection,
@@ -2611,86 +3148,6 @@ public final class VoxyBlaze3DProbeRenderer {
         return dx * dx + dz * dz;
     }
 
-    private static void rebuildLodSection(WorldEngine world, LodSectionCoordinate coordinate, TextureAtlasSprite fallbackSprite) {
-        lodMeshBuildAttempts++;
-        int lodLevel = WorldEngine.getLevel(coordinate.key());
-        long fingerprint = getNeighborhoodFingerprint(world, lodLevel, coordinate.x(), coordinate.y(), coordinate.z());
-        VanillaRenderBoundary vanillaBoundary = activeVanillaBoundary;
-        if (fingerprint == Long.MIN_VALUE) {
-            lodMeshMissingSections++;
-            removeLodMesh(coordinate.key());
-            lodMeshFingerprints.remove(coordinate.key());
-            return;
-        }
-        if (Long.valueOf(fingerprint).equals(lodMeshFingerprints.get(coordinate.key()))) {
-            lodMeshUnchanged++;
-            return;
-        }
-
-        WorldSection section = world.acquireIfExists(coordinate.key());
-        if (section == null) {
-            lodMeshMissingSections++;
-            removeLodMesh(coordinate.key());
-            lodMeshFingerprints.remove(coordinate.key());
-            return;
-        }
-
-        long[] data;
-        try {
-            data = section.copyData();
-        } finally {
-            section.release();
-        }
-
-        SectionNeighborhood neighborhood = new SectionNeighborhood(
-                data,
-                copySectionData(world, lodLevel, coordinate.x() - 1, coordinate.y(), coordinate.z()),
-                copySectionData(world, lodLevel, coordinate.x() + 1, coordinate.y(), coordinate.z()),
-                copySectionData(world, lodLevel, coordinate.x(), coordinate.y() - 1, coordinate.z()),
-                copySectionData(world, lodLevel, coordinate.x(), coordinate.y() + 1, coordinate.z()),
-                copySectionData(world, lodLevel, coordinate.x(), coordinate.y(), coordinate.z() - 1),
-                copySectionData(world, lodLevel, coordinate.x(), coordinate.y(), coordinate.z() + 1));
-        QuadCounts quadCounts = countModelQuads(neighborhood, world.getMapper(), fallbackSprite,
-                coordinate, voxelSize(lodLevel), vanillaBoundary);
-        if (quadCounts.isEmpty()) {
-            lodMeshEmpty++;
-            removeLodMesh(coordinate.key());
-            lodMeshFingerprints.put(coordinate.key(), fingerprint);
-            return;
-        }
-
-        long requestedGeometryBytes = geometryBytes(quadCounts.opaque(), quadCounts.water());
-        if (lodGeometryBytes + requestedGeometryBytes > lodGeometryBudgetBytes) {
-            lodGeometryBudgetExhausted = true;
-            lodGeometryBudgetRejections++;
-            if (!loggedLodGeometryBudgetExhaustion) {
-                loggedLodGeometryBudgetExhaustion = true;
-                Logger.warn("Blaze3D LoD geometry budget reached at " + formatBytes(lodGeometryBytes)
-                        + "/" + formatBytes(lodGeometryBudgetBytes)
-                        + "; keeping coarser parent coverage instead of allocating another "
-                        + formatBytes(requestedGeometryBytes) + " for " + WorldEngine.pprintPos(coordinate.key()) + ".");
-            }
-            return;
-        }
-
-        GpuBuffer opaqueBuffer = null;
-        GpuBuffer waterBuffer = null;
-        try {
-            opaqueBuffer = buildLodMesh(coordinate, neighborhood, world.getMapper(), fallbackSprite,
-                    voxelSize(lodLevel), vanillaBoundary, false, quadCounts.opaque());
-            waterBuffer = buildLodMesh(coordinate, neighborhood, world.getMapper(), fallbackSprite,
-                    voxelSize(lodLevel), vanillaBoundary, true, quadCounts.water());
-            replaceLodMesh(coordinate, opaqueBuffer, quadCounts.opaque() * LOD_VERTICES_PER_QUAD,
-                    waterBuffer, quadCounts.water() * LOD_VERTICES_PER_QUAD);
-        } catch (RuntimeException exception) {
-            releaseLodMeshBuffer(opaqueBuffer, coordinate.key());
-            releaseLodMeshBuffer(waterBuffer, coordinate.key());
-            throw exception;
-        }
-        lodMeshUploads++;
-        lodMeshFingerprints.put(coordinate.key(), fingerprint);
-    }
-
     private static void resetLodDiagnostics() {
         lodMeshBuildAttempts = 0;
         lodMeshUploads = 0;
@@ -2716,72 +3173,37 @@ public final class VoxyBlaze3DProbeRenderer {
         lastSelectionReason = "none";
     }
 
-    @Nullable
-    private static GpuBuffer buildLodMesh(LodSectionCoordinate coordinate,
-                                          SectionNeighborhood neighborhood,
-                                          Mapper mapper,
-                                          TextureAtlasSprite fallbackSprite,
-                                          int voxelSize,
-                                          VanillaRenderBoundary vanillaBoundary,
-                                          boolean translucentOnly,
-                                          int quadCount) {
-        if (quadCount == 0) {
-            return null;
-        }
-        int vertexCount = quadCount * LOD_VERTICES_PER_QUAD;
-        int bufferSize = vertexCount * LOD_VERTEX_FORMAT.getVertexSize();
-        try (ByteBufferBuilder byteBuffer = ByteBufferBuilder.exactlySized(bufferSize)) {
-            // Iris normally replaces this glyph-compatible format with its larger extended
-            // format while a shader pack is rendering the level. This buffer is exactly sized
-            // for Voxy's pipeline, so keep the format and stride declared by that pipeline.
-            BufferBuilder builder = IrisUtil.runWithoutVertexFormatExtension(
-                    () -> new BufferBuilder(byteBuffer, PrimitiveTopology.TRIANGLES, LOD_VERTEX_FORMAT));
-            int emittedQuads = emitModelQuads(builder, neighborhood, coordinate.x(), coordinate.y(), coordinate.z(), voxelSize,
-                    quadCount, mapper, fallbackSprite, coordinate, vanillaBoundary, translucentOnly);
-            if (emittedQuads != quadCount) {
-                throw new IllegalStateException("LoD " + (translucentOnly ? "translucent" : "opaque")
-                        + " mesh quad count changed while building: expected " + quadCount + ", got " + emittedQuads);
-            }
-            try (MeshData mesh = builder.buildOrThrow()) {
-                return RenderSystem.getDevice().createBuffer(
-                        () -> "Voxy Blaze3D LoD " + (translucentOnly ? "translucent " : "opaque ") + WorldEngine.pprintPos(coordinate.key()),
-                        GpuBuffer.USAGE_VERTEX | GpuBuffer.USAGE_COPY_DST,
-                        mesh.vertexBuffer());
-            }
-        }
-    }
-
-    private static long getNeighborhoodFingerprint(WorldEngine world, int lodLevel, int sectionX, int sectionY, int sectionZ) {
-        long center = getSectionRevision(world, lodLevel, sectionX, sectionY, sectionZ);
-        if (center == Long.MIN_VALUE) {
-            return Long.MIN_VALUE;
-        }
-        long fingerprint = mixRevision(0x9E3779B97F4A7C15L, center);
-        // RenderDataFactory samples the full 3x3x3 neighbourhood (not only six faces), notably
-        // for fluid corner heights. Mirror that dependency so a diagonal update invalidates the
-        // same section that Cortex's native dirty path would rebuild.
-        for (int dy = -1; dy <= 1; dy++) {
-            for (int dz = -1; dz <= 1; dz++) {
-                for (int dx = -1; dx <= 1; dx++) {
-                    if (dx == 0 && dy == 0 && dz == 0) continue;
-                    fingerprint = mixRevision(fingerprint,
-                            getSectionRevision(world, lodLevel, sectionX + dx, sectionY + dy, sectionZ + dz));
+    private static long computeNeighborhoodFingerprint(WorldEngine world, long key, Blaze3dBenchmark session) {
+        long started = session == null || !session.active() ? 0 : System.nanoTime();
+        int level = WorldEngine.getLevel(key), x = WorldEngine.getX(key), y = WorldEngine.getY(key), z = WorldEngine.getZ(key);
+        int acquisitions = 1;
+        try {
+            long center = readSectionRevision(world, key);
+            if (center == Long.MIN_VALUE) return Long.MIN_VALUE;
+            long fingerprint = mixRevision(0x9E3779B97F4A7C15L, center);
+            // Cortex samples diagonals too, notably for fluid corner heights.
+            for (int dy = -1; dy <= 1; dy++) {
+                for (int dz = -1; dz <= 1; dz++) {
+                    for (int dx = -1; dx <= 1; dx++) {
+                        if (dx == 0 && dy == 0 && dz == 0) continue;
+                        acquisitions++;
+                        fingerprint = mixRevision(fingerprint, readSectionRevision(world,
+                                WorldEngine.getWorldSectionId(level, x + dx, y + dy, z + dz)));
+                    }
                 }
             }
+            return fingerprint;
+        } finally {
+            if (started != 0 && session.active()) session.event("ASYNC_FINGERPRINT",
+                    "key=" + key + " ns=" + (System.nanoTime() - started) + " acquisitions=" + acquisitions);
         }
-        return fingerprint;
     }
 
-    private static long getSectionRevision(WorldEngine world, int lodLevel, int sectionX, int sectionY, int sectionZ) {
-        WorldSection section = world.acquireIfExists(lodLevel, sectionX, sectionY, sectionZ);
-        if (section == null) {
-            return -1L;
-        }
-        try {
-            return section.getRenderRevision();
-        } finally {
-            section.release();
-        }
+    private static long readSectionRevision(WorldEngine world, long key) {
+        WorldSection section = world.acquireIfExists(key);
+        if (section == null) return Long.MIN_VALUE;
+        try { return section.getRenderRevision(); }
+        finally { section.release(); }
     }
 
     private static long mixRevision(long hash, long revision) {
@@ -2789,7 +3211,7 @@ public final class VoxyBlaze3DProbeRenderer {
     }
 
     private static long[] copySectionData(WorldEngine world, int lodLevel, int sectionX, int sectionY, int sectionZ) {
-        WorldSection section = world.acquireIfExists(lodLevel, sectionX, sectionY, sectionZ);
+        WorldSection section = benchmarkAcquire(world, WorldEngine.getWorldSectionId(lodLevel, sectionX, sectionY, sectionZ));
         if (section == null) {
             return null;
         }
@@ -3671,13 +4093,10 @@ public final class VoxyBlaze3DProbeRenderer {
         return buffer;
     }
 
-    private static void replaceLodMesh(LodSectionCoordinate coordinate,
-                                       @Nullable GpuBuffer opaqueBuffer,
-                                       int opaqueVertexCount,
-                                       @Nullable GpuBuffer waterBuffer,
-                                       int waterVertexCount) {
+    private static void replaceLodMesh(LodSectionCoordinate coordinate, GpuBuffer instances,
+                                       int opaqueQuadCount, int waterQuadCount, int aabb) {
         removeLodMesh(coordinate.key());
-        LodSectionMesh mesh = new LodSectionMesh(coordinate, opaqueBuffer, opaqueVertexCount, waterBuffer, waterVertexCount);
+        LodSectionMesh mesh = new LodSectionMesh(coordinate, instances, opaqueQuadCount, waterQuadCount, aabb);
         lodMeshes.put(coordinate.key(), mesh);
         lodMeshLastUsedFrames.put(coordinate.key(), frameCount);
         lodGeometryBytes += geometryBytes(mesh);
@@ -3692,14 +4111,15 @@ public final class VoxyBlaze3DProbeRenderer {
         }
         lodMeshLastUsedFrames.remove(sectionKey);
         lodGeometryBytes = Math.max(0L, lodGeometryBytes - geometryBytes(previous));
-        releaseLodMeshBuffer(previous.opaqueVertexBuffer(), sectionKey);
-        releaseLodMeshBuffer(previous.waterVertexBuffer(), sectionKey);
+        releaseLodMeshBuffer(previous.instanceBuffer(), sectionKey);
         updateGeometryBudgetState();
     }
 
     private static void clearLodMeshes() {
         unavailableLodSections.clear();
-        activeBuildRing = 0;
+        coarseningCoverage.clear();
+        visibleLodMeshes.clear();
+        visibleWaterMeshes.clear();
         publishedLodViewProjection = null;
         clearCachedLodMeshes();
         zoomRetainedKeys.clear();
@@ -3707,8 +4127,7 @@ public final class VoxyBlaze3DProbeRenderer {
         zoomRetentionActive = false;
         int meshCount = lodMeshes.size();
         for (LodSectionMesh mesh : lodMeshes.values()) {
-            releaseLodMeshBuffer(mesh.opaqueVertexBuffer(), mesh.coordinate().key());
-            releaseLodMeshBuffer(mesh.waterVertexBuffer(), mesh.coordinate().key());
+            releaseLodMeshBuffer(mesh.instanceBuffer(), mesh.coordinate().key());
         }
         lodMeshes.clear();
         lodMeshLastUsedFrames.clear();
@@ -3744,7 +4163,21 @@ public final class VoxyBlaze3DProbeRenderer {
         return refined;
     }
 
+    private static void retainCoarseningCoverage(List<LodSectionCoordinate> selected) {
+        List<Long> drawn = new ArrayList<>();
+        for (LodSectionMesh mesh : lodMeshes.values()) {
+            long key = mesh.coordinate().key();
+            if (isActiveRenderMesh(key) && !isCoveredByCoarserMesh(mesh.coordinate())) drawn.add(key);
+        }
+        coarseningCoverage.retarget(drawn, sectionKeys(selected), lodMeshFingerprints.keySet(), key -> {
+            if (WorldEngine.getLevel(key) == WorldEngine.MAX_LOD_LAYER) return key;
+            return parentKey(new LodSectionCoordinate(key,
+                    WorldEngine.getX(key), WorldEngine.getY(key), WorldEngine.getZ(key)));
+        });
+    }
+
     private static void prepareLodTransition(List<LodSectionCoordinate> selected, Set<Long> refinedParents) {
+        long transitionStart = profileNow();
         Set<Long> pendingReveals = Set.copyOf(transitionRevealKeys);
         LinkedHashMap<Long, LodSectionCoordinate> requiredNodes = new LinkedHashMap<>();
         for (LodSectionCoordinate leaf : selected) {
@@ -3771,14 +4204,15 @@ public final class VoxyBlaze3DProbeRenderer {
             }
         }
 
-        // Finish every nearby ring before spending workers on distant detail. Siblings share
-        // their parent's priority so each branch can hand off without waiting on a farther ring.
+        // Establish nearby coverage before detail within each ring. Siblings share priority, but a
+        // branch waiting on data, models or memory never acts as a global streaming barrier.
         transitionBuildSections = orderLodBuildsByRing(requiredNodes.values());
         budgetDeferredMeshes.keySet().retainAll(requiredNodes.keySet());
         unavailableLodSections.retainAll(requiredNodes.keySet());
         updateGeometryBudgetState();
         transitionPendingChildren.clear();
         transitionParentKeys.clear();
+        bypassedIntermediateKeys.clear();
         clearTransitionReveals();
         transitionCoverageReadyKeys.clear();
 
@@ -3797,6 +4231,11 @@ public final class VoxyBlaze3DProbeRenderer {
                 List<Long> children = childrenByParent.get(node.key());
                 if (children != null && children.stream().allMatch(transitionCoverageReadyKeys::contains)) {
                     transitionCoverageReadyKeys.add(node.key());
+                    if (Blaze3dLodStreaming.skipIntermediate(level, WorldEngine.MAX_LOD_LAYER,
+                            false, lodMeshFingerprints.containsKey(node.key()), true)) {
+                        bypassedIntermediateKeys.add(node.key());
+                        benchmarkCount(Blaze3dBenchmark.Counter.BYPASSED);
+                    }
                 }
             }
         }
@@ -3841,6 +4280,13 @@ public final class VoxyBlaze3DProbeRenderer {
         watched.addAll(transitionParentKeys);
         watchedLodKeys = Set.copyOf(watched);
         dirtyLodKeys.retainAll(watched);
+        // Partial publications restart scheduling. Do not repeatedly scan thousands of already
+        // resident nodes before reaching the newly selected work at the end of the frontier.
+        transitionBuildSections = transitionBuildSections.stream()
+                .filter(node -> isActiveRenderMesh(node.key())
+                        && !transitionCoverageReadyKeys.contains(node.key()))
+                .toList();
+        benchmarkStage(Blaze3dBenchmark.Stage.TRANSITION, transitionStart);
     }
 
     private static void markTransitionCoverageReady(long sectionKey) {
@@ -3917,14 +4363,19 @@ public final class VoxyBlaze3DProbeRenderer {
                 continue;
             }
             transitionRevealKeys.remove(key);
+            boolean resident = lodMeshes.containsKey(key);
             finishTransitionParent(key);
-            revealedThisFrame.add(key);
-            revealed++;
+            if (resident) {
+                revealedThisFrame.add(key);
+                revealed++;
+            }
         }
     }
 
     private static void finishTransitionParent(long parentKey) {
         transitionParentKeys.remove(parentKey);
+        benchmarkEvent("HANDOFF", "frame=" + frameCount + " key=" + parentKey + " level=" + WorldEngine.getLevel(parentKey)
+                + " resident=" + lodMeshes.containsKey(parentKey) + " remainingParents=" + transitionParentKeys.size());
         if (lodMeshFingerprints.containsKey(parentKey)) {
             // The parent stops drawing, but remains resident just like Cortex's native node
             // cache. A later camera turn can reuse it without rebuilding its geometry.
@@ -4019,6 +4470,7 @@ public final class VoxyBlaze3DProbeRenderer {
         // native renderer turn the camera without regenerating the same geometry repeatedly.
         transitionPendingChildren.clear();
         transitionParentKeys.clear();
+        bypassedIntermediateKeys.clear();
         clearTransitionReveals();
         transitionCoverageReadyKeys.clear();
         transitionBuildSections = sections;
@@ -4047,9 +4499,8 @@ public final class VoxyBlaze3DProbeRenderer {
         if (!Double.isFinite(buildPriorityCameraZ)) buildPriorityCameraZ = 0.0;
         float subdivision = VoxyConfig.CONFIG.subDivisionSize * lodBudgetSubdivisionScale;
         buildRingWidth = lodRingWidth(subdivision * subdivision);
-        activeBuildRing = 0;
         return nodes.stream().sorted(Comparator
-                .comparingInt(VoxyBlaze3DProbeRenderer::buildRing)
+                .comparingInt(VoxyBlaze3DProbeRenderer::buildPriority)
                 .thenComparingInt(node -> -WorldEngine.getLevel(node.key()))
                 .thenComparingDouble(node -> horizontalSectionDistance(node, buildPriorityCameraX, buildPriorityCameraZ))
                 .thenComparingLong(LodSectionCoordinate::key)).toList();
@@ -4066,23 +4517,9 @@ public final class VoxyBlaze3DProbeRenderer {
         return lodRing(coordinate, buildPriorityCameraX, buildPriorityCameraZ, buildRingWidth);
     }
 
-    private static boolean hasPendingWorkInBuildRing() {
-        if (firstIncompleteInBuildRing() >= 0) return true;
-        for (long key : transitionRevealKeys) {
-            if (buildRing(new LodSectionCoordinate(key, WorldEngine.getX(key), WorldEngine.getY(key),
-                    WorldEngine.getZ(key))) <= activeBuildRing) return true;
-        }
-        return false;
-    }
-
-    private static int firstIncompleteInBuildRing() {
-        for (int index = 0; index < transitionBuildSections.size(); index++) {
-            LodSectionCoordinate node = transitionBuildSections.get(index);
-            if (buildRing(node) > activeBuildRing) break;
-            if (isActiveRenderMesh(node.key()) && !transitionCoverageReadyKeys.contains(node.key())
-                    && !unavailableLodSections.contains(node.key())) return index;
-        }
-        return -1;
+    private static int buildPriority(LodSectionCoordinate coordinate) {
+        return Blaze3dLodStreaming.buildPriority(WorldEngine.getLevel(coordinate.key()),
+                WorldEngine.MAX_LOD_LAYER, buildRing(coordinate));
     }
 
     private static void evictMeshesOutsideRenderGrid() {
@@ -4187,9 +4624,10 @@ public final class VoxyBlaze3DProbeRenderer {
     }
 
     private static long geometryAdmissionLimit(long sectionKey) {
-        // One maximal opaque+translucent section is 14 MiB. Leave room for an atomic
-        // replacement, which allocates the new generation before releasing the old one.
-        return lodMeshes.containsKey(sectionKey) ? lodGeometryBudgetBytes
+        // Keep the existing 16 MiB replacement reserve even with compact quads. The saved
+        // space can cover more resident detail and concurrent handoffs instead of shrinking VRAM.
+        return lodMeshes.containsKey(sectionKey) || coarseningCoverage.isReplacement(sectionKey)
+                ? lodGeometryBudgetBytes
                 : Math.max(0L, lodGeometryBudgetBytes - 16L * 1024L * 1024L);
     }
 
@@ -4261,18 +4699,12 @@ public final class VoxyBlaze3DProbeRenderer {
         }
     }
 
-    private static int indexCount(int vertexCount) {
-        return vertexCount / LOD_VERTICES_PER_QUAD * LOD_INDICES_PER_QUAD;
-    }
-
     private static long geometryBytes(int opaqueQuads, int waterQuads) {
-        return (long) (opaqueQuads + waterQuads) * LOD_VERTICES_PER_QUAD * LOD_VERTEX_FORMAT.getVertexSize();
+        return Blaze3dQuadEncoder.bytes(opaqueQuads + waterQuads);
     }
 
     private static long geometryBytes(LodSectionMesh mesh) {
-        long opaqueBytes = mesh.opaqueVertexBuffer() == null ? 0L : mesh.opaqueVertexBuffer().size();
-        long waterBytes = mesh.waterVertexBuffer() == null ? 0L : mesh.waterVertexBuffer().size();
-        return opaqueBytes + waterBytes;
+        return mesh.instanceBuffer().size();
     }
 
     private static long readGeometryBudgetBytes() {
@@ -4400,6 +4832,7 @@ public final class VoxyBlaze3DProbeRenderer {
         private final PriorityQueue<LodSectionCoordinate> pending;
         private final double ringWidth;
         private int publishedRing = -1;
+        private long lastPublishedFrame;
         private final Map<Long, List<LodSectionCoordinate>> previousDescendants = new HashMap<>();
         private final List<LodSectionCoordinate> selected;
         private final long startedFrame;
@@ -4424,7 +4857,10 @@ public final class VoxyBlaze3DProbeRenderer {
                                  String invalidationReason) {
             this.world = world;
             this.viewProjection = new Matrix4f(viewProjection);
-            this.frustum = new FrustumIntersection(this.viewProjection, false);
+            // Refine just beyond the screen edges before a turn exposes those branches.
+            // Actual draw culling continues to use the exact, unexpanded projection.
+            this.frustum = new FrustumIntersection(new Matrix4f().scaling(0.85f, 0.85f, 1.0f)
+                    .mul(this.viewProjection), false);
             this.cameraX = cameraX;
             this.cameraY = cameraY;
             this.cameraZ = cameraZ;
@@ -4441,6 +4877,7 @@ public final class VoxyBlaze3DProbeRenderer {
                     .thenComparingLong(LodSectionCoordinate::key));
             this.selected = selected;
             this.startedFrame = startedFrame;
+            this.lastPublishedFrame = startedFrame;
             this.invalidationReason = invalidationReason;
         }
 
@@ -4477,11 +4914,17 @@ public final class VoxyBlaze3DProbeRenderer {
         }
     }
 
-    private record LodSectionMesh(LodSectionCoordinate coordinate,
-                                  @Nullable GpuBuffer opaqueVertexBuffer,
-                                  int opaqueVertexCount,
-                                  @Nullable GpuBuffer waterVertexBuffer,
-                                  int waterVertexCount) {
+    private record LodSectionMesh(LodSectionCoordinate coordinate, GpuBuffer instanceBuffer,
+                                  int opaqueQuadCount, int waterQuadCount, int aabb,
+                                  GpuBufferSlice sectionUniform, @Nullable GpuBufferSlice opaqueInstances,
+                                  @Nullable GpuBufferSlice waterInstances) {
+        private LodSectionMesh(LodSectionCoordinate coordinate, GpuBuffer buffer,
+                               int opaqueQuads, int waterQuads, int aabb) {
+            this(coordinate, buffer, opaqueQuads, waterQuads, aabb, buffer.slice(0, Blaze3dQuadEncoder.SECTION_BYTES),
+                    opaqueQuads == 0 ? null : buffer.slice(Blaze3dQuadEncoder.SECTION_BYTES + (long) waterQuads * Blaze3dSectionMesh.QUAD_STRIDE,
+                            (long) opaqueQuads * Blaze3dSectionMesh.QUAD_STRIDE),
+                    waterQuads == 0 ? null : buffer.slice(Blaze3dQuadEncoder.SECTION_BYTES, (long) waterQuads * Blaze3dSectionMesh.QUAD_STRIDE));
+        }
     }
 
     private static void addMarker(BufferBuilder builder, CameraTransform camera, TextureAtlasSprite dirtSprite) {
