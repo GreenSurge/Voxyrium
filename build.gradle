@@ -370,7 +370,7 @@ jar {
     }
 }
 
-project.ext.lwjglVersion = "3.4.1"
+project.ext.lwjglVersion = "3.4.3"
 
 // --- Voxy Vulkan backend deps (optional at runtime; probed via capability detection) ---
 dependencies {
@@ -450,6 +450,8 @@ tasks.register('verifyBlaze3dBackendIsolation') {
                 'org.lwjgl.vulkan',
                 'com.mojang.blaze3d.opengl',
                 'com.mojang.blaze3d.vulkan',
+                'com.mojang.renderpearl.backend.opengl',
+                'com.mojang.renderpearl.backend.vulkan',
                 'me.cortex.voxy.client.core.gl',
                 'me.cortex.voxy.client.core.vk'
         ]

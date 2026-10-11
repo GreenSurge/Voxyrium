@@ -85,8 +85,8 @@ public abstract class MixinDefaultChunkRenderer extends ShaderChunkRenderer {
                     viewport = renderer.setupViewport(matrices.projection(), matrices.modelView(), fogParameters, target.width, target.height, camera.x, camera.y, camera.z);
                 }
                 renderer.renderOpaque(viewport,
-                        ((com.mojang.blaze3d.opengl.GlTextureView)target.getDepthTextureView()).glId(),
-                        ((com.mojang.blaze3d.opengl.GlTextureView)target.getColorTextureView()).glId());
+                        ((GlTextureView)target.getDepthTextureView()).glId(),
+                        ((GlTextureView)target.getColorTextureView()).glId());
             }
             return;
         }
