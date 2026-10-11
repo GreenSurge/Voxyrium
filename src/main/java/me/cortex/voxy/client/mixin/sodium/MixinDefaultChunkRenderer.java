@@ -6,10 +6,8 @@ import com.mojang.renderpearl.api.commands.RenderPass;
 import com.mojang.renderpearl.api.textures.GpuSampler;
 import com.mojang.renderpearl.backend.opengl.GlTextureView;
 import me.cortex.voxy.client.VoxyClient;
-import me.cortex.voxy.client.config.VoxyConfig;
 import me.cortex.voxy.client.core.IVoxyRenderSystemHolder;
 import me.cortex.voxy.client.core.backend.VoxyGraphicsBackend;
-import me.cortex.voxy.client.core.backend.blaze3d.VoxyBlaze3DProbeRenderer;
 import me.cortex.voxy.client.core.rendering.Viewport;
 import me.cortex.voxy.client.core.util.IrisUtil;
 import net.caffeinemc.mods.sodium.client.render.chunk.ChunkRenderMatrices;
@@ -47,15 +45,6 @@ public abstract class MixinDefaultChunkRenderer extends ShaderChunkRenderer {
 
     @Inject(method = "render", at = @At(value = "INVOKE", target = "Lnet/caffeinemc/mods/sodium/client/render/chunk/ShaderChunkRenderer;end(Lnet/caffeinemc/mods/sodium/client/render/chunk/terrain/TerrainRenderPass;)V", shift = At.Shift.BEFORE))
     private void voxy$injectRender(ChunkRenderMatrices matrices, ChunkRenderListIterable renderLists, TerrainRenderPass renderPass, CameraTransform camera, FogParameters parameters, boolean indexedRenderingEnabled, RenderPass pass, GpuSampler terrainSampler, GpuBufferSlice uniformData, GpuBuffer sectionTimeInfo, OitStage stage, CallbackInfo ci) {
-        // Match the native renderer's ordering: Sodium's solid and cutout terrain must populate
-        // the depth target before Voxy draws. Rendering at the head of SOLID made coincident LoD
-        // surfaces fight with the blocks that Sodium rendered immediately afterwards.
-        if (renderPass == DefaultTerrainRenderPasses.CUTOUT
-                && VoxyConfig.CONFIG.isBlaze3dRenderingEnabled()
-                && !IrisUtil.irisShadowActive()) {
-            var target = renderPass.getTarget();
-            VoxyBlaze3DProbeRenderer.renderOpaque(matrices, target.getColorTextureView(), target.getDepthTextureView(), camera, parameters);
-        }
         this.doRender(matrices, renderPass, camera, parameters);
     }
 
@@ -91,13 +80,5 @@ public abstract class MixinDefaultChunkRenderer extends ShaderChunkRenderer {
             return;
         }
 
-        if (renderPass == DefaultTerrainRenderPasses.TRANSLUCENT
-                && VoxyConfig.CONFIG.isBlaze3dRenderingEnabled()
-                && !IrisUtil.irisShadowActive()) {
-            var target = renderPass.getTarget();
-            VoxyBlaze3DProbeRenderer.renderWater(matrices, target.getColorTextureView(), target.getDepthTextureView(), camera, fogParameters);
-            VoxyBlaze3DProbeRenderer.renderGlobalFog(
-                    matrices, target.getColorTextureView(), target.getDepthTextureView(), fogParameters);
-        }
     }
 }

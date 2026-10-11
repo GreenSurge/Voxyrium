@@ -23,6 +23,7 @@
     "minecraft.MixinLevelExtractor",
     "minecraft.MixinLevelRenderer",
     "minecraft.MixinRenderSystem",
+    "minecraft.MixinTerrainRenderPasses",
     "minecraft.session.MixinClientPacketListener",
     "minecraft.session.MixinMinecraft",
     "minecraft.util.MixinBlockableEventLoop",
@@ -38,9 +39,9 @@
     "sodium.MixinRenderRegionManager",
     "sodium.MixinRenderSectionManager",
     "sodium.MixinSodiumWorldRenderer",
+    "sodium.MixinTerrainRenderContext",
     "sodium.MixinVisibleChunkCollector",
     "vk.AccessorVulkanCommandEncoder",
-    "vk.MixinSodiumOpaqueVkFrame",
     "vk.MixinVulkanDevice"
   ],
   "injectors": {

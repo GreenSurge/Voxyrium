@@ -1,0 +1,54 @@
+package me.cortex.voxy.client.core;
+
+import me.cortex.voxy.client.core.backend.VoxyGraphicsBackend;
+import me.cortex.voxy.client.core.backend.blaze3d.VoxyBlaze3DProbeRenderer;
+import me.cortex.voxy.client.core.util.IrisUtil;
+import me.cortex.voxy.client.core.vk.MinecraftVkHost;
+import me.cortex.voxy.client.core.vk.MinecraftVkHostAdapter;
+import net.caffeinemc.mods.sodium.client.render.chunk.ChunkRenderMatrices;
+import net.caffeinemc.mods.sodium.client.render.viewport.CameraTransform;
+import net.caffeinemc.mods.sodium.client.util.GameRendererStorage;
+import net.minecraft.client.Minecraft;
+
+/** Render-thread context retained until Minecraft closes its terrain pass in 26.3. */
+public final class VoxyTerrainRendering {
+    private static ChunkRenderMatrices matrices;
+    private static CameraTransform camera;
+
+    public static void capture(ChunkRenderMatrices matrices, double x, double y, double z) {
+        VoxyTerrainRendering.matrices = matrices;
+        camera = new CameraTransform(x, y, z);
+    }
+
+    public static void renderOpaque() {
+        if (matrices == null || IrisUtil.irisShadowActive()) return;
+        var gameRenderer = Minecraft.getInstance().gameRenderer;
+        var target = gameRenderer.mainRenderTarget();
+        if (VoxyGraphicsBackend.usesBlaze3dRenderer()) {
+            VoxyBlaze3DProbeRenderer.renderOpaque(matrices, target.getColorTextureView(),
+                    target.getDepthTextureView(), camera, ((GameRendererStorage) gameRenderer).sodium$getFogParameters());
+        } else if (VoxyGraphicsBackend.usesNativeVulkanRenderer()
+                && MinecraftVkHost.get() instanceof MinecraftVkHostAdapter adapter) {
+            var renderer = IVoxyRenderSystemHolder.getNullable();
+            if (renderer != null && renderer.vkCore != null) {
+                renderer.vkCore.renderFrame(target, adapter, matrices, camera.x, camera.y, camera.z);
+            }
+        }
+    }
+
+    public static void renderTranslucent() {
+        try {
+            if (matrices == null || !VoxyGraphicsBackend.usesBlaze3dRenderer() || IrisUtil.irisShadowActive()) return;
+            var gameRenderer = Minecraft.getInstance().gameRenderer;
+            var target = gameRenderer.mainRenderTarget();
+            var fog = ((GameRendererStorage) gameRenderer).sodium$getFogParameters();
+            VoxyBlaze3DProbeRenderer.renderWater(matrices, target.getColorTextureView(), target.getDepthTextureView(), camera, fog);
+            VoxyBlaze3DProbeRenderer.renderGlobalFog(matrices, target.getColorTextureView(), target.getDepthTextureView(), fog);
+        } finally {
+            matrices = null;
+            camera = null;
+        }
+    }
+
+    private VoxyTerrainRendering() {}
+}
