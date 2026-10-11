@@ -43,7 +43,7 @@ public final class Blaze3dPipelineTargetsTest {
         // 26.3 no longer creates a default colour attachment. Check every production pass.
         for (String name : List.of("MARKER_PIPELINE", "LOD_PIPELINE", "LOD_WATER_PIPELINE",
                 "LOD_OVERLAY_PIPELINE", "LOD_WATER_OVERLAY_PIPELINE", "LOD_COMPOSITE_PIPELINE",
-                "LOD_TRANSLUCENT_COMPOSITE_PIPELINE", "GLOBAL_FOG_PIPELINE")) {
+                "LOD_TRANSLUCENT_COMPOSITE_PIPELINE")) {
             var field = VoxyBlaze3DProbeRenderer.class.getDeclaredField(name);
             field.setAccessible(true);
             Object value = field.get(null);
@@ -95,8 +95,8 @@ public final class Blaze3dPipelineTargetsTest {
         } catch (IllegalStateException expected) {
             if (!expected.getMessage().contains("attachment count")) throw expected;
         }
-        if (accepted != 21) throw new AssertionError("Invalid pipelines must fail before backend submission");
-        System.out.println("Blaze3D pipeline targets: 21 actual variants accepted; missing colour attachment, wrong format and discard variants checked without a GPU.");
+        if (accepted != 19) throw new AssertionError("Invalid pipelines must fail before backend submission");
+        System.out.println("Blaze3D pipeline targets: 19 actual variants accepted; missing colour attachment, wrong format and discard variants checked without a GPU.");
     }
 
     private static void verify(RenderPipeline pipeline, GpuFormat format) {

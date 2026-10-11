@@ -12,13 +12,13 @@ A fork of Voxy with native OpenGL/Vulkan renderers and an experimental Blaze3D c
 
 ## Blaze3D Renderer (Experimental)
 
-The alternative renderer uses only Minecraft 26.2's public **Blaze3D API**. It should therefore run on any device capable of Minecraft's minimum graphics requirements, including **OpenGL 3.3** hardware.
+The alternative renderer uses Minecraft's public **Blaze3D API** in both 26.2 and 26.3. It should therefore run on any device capable of Minecraft's minimum graphics requirements, including **OpenGL 3.3** hardware.
 
 Its goal is to reproduce Voxy's rendering and performance as closely as possible while remaining completely independent of the underlying graphics API.
 
 There is, however, a fundamental performance ceiling: Blaze3D does not expose enough of the GPU to reproduce Voxy's native GPU-driven pipeline.
 
-| GPU feature                       | Blaze3D 26.2 | Limitation                                                            |
+| GPU feature                       | Blaze3D 26.2 / 26.3 | Limitation                                                            |
 | --------------------------------- | ------------ | --------------------------------------------------------------------- |
 | Vertex/index/uniform/copy buffers | ✅            | Fully usable                                                          |
 | Indirect command buffers          | ⚠️           | `drawIndexedIndirect(...)`, but one command per call                  |

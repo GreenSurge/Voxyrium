@@ -29,7 +29,7 @@ public class MixinFogRenderer {
     @Inject(method = "setupFog", at = @At("RETURN"))
     private void voxy$modifyFog(Camera camera, int renderDistanceInChunks, DeltaTracker deltaTracker, float darkenWorldAmount, ClientLevel level, CallbackInfoReturnable<FogData> cir) {
         boolean blaze3dProbeActive = VoxyConfig.CONFIG.isBlaze3dRenderingEnabled()
-                && VoxyBlaze3DProbeRenderer.canApplyGlobalFog();
+                && VoxyBlaze3DProbeRenderer.canApplyTerrainFog();
         boolean nativeRendererActive = VoxyConfig.CONFIG.isRenderingEnabled()
                 && IVoxyRenderSystemHolder.getNullable() != null;
         if (!blaze3dProbeActive && !nativeRendererActive) return;
@@ -42,7 +42,7 @@ public class MixinFogRenderer {
                     data.renderDistanceStart, data.renderDistanceEnd);
             if (!voxy$loggedBlaze3dFogReplacement) {
                 voxy$loggedBlaze3dFogReplacement = true;
-                Logger.info("Blaze3D renderer replacing per-geometry render fog with one depth-based world pass: environmental="
+                Logger.info("Blaze3D renderer extending terrain fog on Voxy LoDs only: environmental="
                         + data.environmentalStart + ".." + data.environmentalEnd
                         + ", render-distance=" + data.renderDistanceStart + ".." + data.renderDistanceEnd);
             }

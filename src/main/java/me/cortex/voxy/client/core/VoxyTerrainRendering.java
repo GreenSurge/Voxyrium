@@ -43,7 +43,6 @@ public final class VoxyTerrainRendering {
             var target = gameRenderer.mainRenderTarget();
             var fog = ((GameRendererStorage) gameRenderer).sodium$getFogParameters();
             VoxyBlaze3DProbeRenderer.renderWater(matrices, target.getColorTextureView(), target.getDepthTextureView(), camera, fog);
-            VoxyBlaze3DProbeRenderer.renderGlobalFog(matrices, target.getColorTextureView(), target.getDepthTextureView(), fog);
         } finally {
             matrices = null;
             camera = null;
