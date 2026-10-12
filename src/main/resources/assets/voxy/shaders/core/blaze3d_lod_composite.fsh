@@ -5,13 +5,13 @@
 layout(std140) uniform DynamicTransforms {
     // The Java side stores the inverse Voxy projection here for reconstruction.
     mat4 ModelViewMat;
+    // Minecraft/Sodium projection used to produce the destination depth.
+    mat4 TextureMat;
     // xyz: world up expressed in view space; w: opacity multiplier.
     vec4 ColorModulator;
     // x is 1 when NDC depth already uses Vulkan's zero-to-one range; yz contain
     // the start/end distances of the Sodium-to-Voxy transition in blocks.
     vec3 ModelOffset;
-    // Minecraft/Sodium projection used to produce the destination depth.
-    mat4 TextureMat;
 };
 
 uniform sampler2D Sampler0;

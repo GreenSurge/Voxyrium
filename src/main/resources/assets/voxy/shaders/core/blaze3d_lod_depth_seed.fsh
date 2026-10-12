@@ -3,9 +3,9 @@
 #include <voxy:blaze3d_fragment_discard.glsl>
 layout(std140) uniform DynamicTransforms {
     mat4 ModelViewMat;
+    mat4 TextureMat;
     vec4 ColorModulator;
     vec3 ModelOffset;
-    mat4 TextureMat;
 };
 uniform sampler2D Sampler0;
 layout(location = 0) in vec2 texCoord;

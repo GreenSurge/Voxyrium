@@ -2,9 +2,9 @@
 #extension GL_ARB_separate_shader_objects : require
 layout(std140) uniform DynamicTransforms {
     mat4 ModelViewMat; // Complete world-to-clip matrix, including camera translation.
+    mat4 TextureMat;
     vec4 ColorModulator;
     vec3 ModelOffset; // source viewport width/height, zero-to-one depth
-    mat4 TextureMat;
 };
 uniform sampler2D Sampler0;
 uniform samplerBuffer VoxyOcclusionOrigins;
