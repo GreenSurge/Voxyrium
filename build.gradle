@@ -8,11 +8,13 @@ def INCLUDE_OTHER_ARCHS = "true".equalsIgnoreCase(project.findProperty("includeO
 
 def isInGHA = System.getenv("GITHUB_ACTIONS") == "true"
 
+apply from: 'gradle/minecraft-versions.gradle'
+
 version = project.mod_version
 group = project.maven_group
 
 base {
-    archivesName = project.archives_base_name
+    archivesName = "${project.archives_base_name}-mc${project.minecraft_version}"
 }
 
 repositories {
@@ -173,10 +175,6 @@ jar {
 
 jar {
     dependsOn(dummySodiumProviderGenerator)
-}
-
-loom {
-    accessWidenerPath = file("src/main/resources/voxy.accesswidener")
 }
 
 def runtimeOnlyMsk = {arg->}
@@ -370,8 +368,6 @@ jar {
     }
 }
 
-project.ext.lwjglVersion = "3.4.1"
-
 // --- Voxy Vulkan backend deps (optional at runtime; probed via capability detection) ---
 dependencies {
     include(implementation("org.lwjgl:lwjgl-vulkan:${project.ext.lwjglVersion}"))
@@ -450,6 +446,8 @@ tasks.register('verifyBlaze3dBackendIsolation') {
                 'org.lwjgl.vulkan',
                 'com.mojang.blaze3d.opengl',
                 'com.mojang.blaze3d.vulkan',
+                'com.mojang.renderpearl.backend.opengl',
+                'com.mojang.renderpearl.backend.vulkan',
                 'me.cortex.voxy.client.core.gl',
                 'me.cortex.voxy.client.core.vk'
         ]
@@ -498,6 +496,8 @@ sourceSets {
     }
 }
 
+configureMinecraftPipelineTests()
+
 tasks.register('verifyBlaze3dLodStreaming', JavaExec) {
     group = 'verification'
     description = 'Checks Blaze3D streaming budgets and coverage transitions without a GPU.'
@@ -529,6 +529,7 @@ tasks.register('verifyBlaze3dPipelineTargets', JavaExec) {
 
 jmh {
     zip64 = true
+    includes = ["SaveLoadJMH"]
     //profilers = ["xperfasm"]
 }
 

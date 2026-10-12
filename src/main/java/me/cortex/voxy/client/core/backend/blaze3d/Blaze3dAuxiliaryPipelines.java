@@ -1,5 +1,15 @@
 package me.cortex.voxy.client.core.backend.blaze3d;
 
+//? if MC_26_3
+import com.mojang.renderpearl.api.GpuFormat;
+import com.mojang.renderpearl.api.pipeline.PrimitiveTopology;
+import com.mojang.renderpearl.api.pipeline.BindGroupLayout;
+import com.mojang.renderpearl.api.pipeline.ColorTargetState;
+import com.mojang.renderpearl.api.pipeline.CompareOp;
+import com.mojang.renderpearl.api.pipeline.DepthStencilState;
+import com.mojang.renderpearl.api.pipeline.RenderPipeline;
+import com.mojang.renderpearl.api.pipeline.UniformType;
+//? else
 import com.mojang.blaze3d.GpuFormat;
 import com.mojang.blaze3d.PrimitiveTopology;
 import com.mojang.blaze3d.pipeline.BindGroupLayout;
@@ -8,6 +18,7 @@ import com.mojang.blaze3d.platform.CompareOp;
 import com.mojang.blaze3d.pipeline.DepthStencilState;
 import com.mojang.blaze3d.pipeline.RenderPipeline;
 import com.mojang.blaze3d.shaders.UniformType;
+//? endif
 import com.mojang.blaze3d.vertex.DefaultVertexFormat;
 import net.minecraft.client.renderer.BindGroupLayouts;
 import net.minecraft.resources.Identifier;
@@ -33,7 +44,12 @@ final class Blaze3dAuxiliaryPipelines {
 
     private static RenderPipeline.Builder fullscreen(String shader, GpuFormat format, int writeMask) {
         return RenderPipeline.builder().withLocation(Identifier.fromNamespaceAndPath("voxy", shader))
+//? if MC_26_3
+                .withBindGroupLayout(BindGroupLayouts.DYNAMIC_TRANSFORMS)
+                .withBindGroupLayout(BindGroupLayouts.PROJECTION)
+//? else
                 .withBindGroupLayout(BindGroupLayouts.MATRICES_PROJECTION)
+//? endif
                 .withBindGroupLayout(BindGroupLayouts.SAMPLER0)
                 .withVertexShader(Identifier.fromNamespaceAndPath("voxy", "core/blaze3d_lod_composite"))
                 .withFragmentShader(Identifier.fromNamespaceAndPath("voxy", "core/" + shader))

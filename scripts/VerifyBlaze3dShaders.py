@@ -16,6 +16,8 @@ def main():
     parser.add_argument("--library", required=True, type=Path)
     parser.add_argument("--require-explicit-locations", action="store_true",
                         help="Match Minecraft 26.3: reject undeclared shader input/output locations.")
+    parser.add_argument("--resources", type=Path,
+                        help="Processed resource directory for a selected Minecraft build.")
     args = parser.parse_args()
     library = ctypes.CDLL(str(args.library.resolve()))
     pointer = ctypes.c_void_p
@@ -38,7 +40,10 @@ def main():
     size = function("result_get_length", ctypes.c_size_t, [pointer])
     data = function("result_get_bytes", pointer, [pointer])
     release = function("result_release", None, [pointer])
-    root = Path(__file__).resolve().parents[1] / "src/main/resources/assets/voxy/shaders"
+    resources = args.resources or Path(__file__).resolve().parents[1] / "build/minecraft-26.2/resources/main"
+    root = resources / "assets/voxy/shaders"
+    if not root.is_dir():
+        raise RuntimeError("Build processResources for the selected Minecraft version before checking shaders.")
 
     def expand(path):
         return re.sub(r"#(?:moj_import|include) <voxy:([^>]+)>",

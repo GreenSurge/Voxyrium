@@ -1,6 +1,10 @@
 package me.cortex.voxy.client.mixin.vk;
 
+//? if MC_26_3
+import com.mojang.renderpearl.backend.vulkan.VulkanCommandEncoder;
+//? else
 import com.mojang.blaze3d.vulkan.VulkanCommandEncoder;
+//? endif
 import org.lwjgl.vulkan.VkCommandBuffer;
 import org.spongepowered.asm.mixin.Mixin;
 import org.spongepowered.asm.mixin.gen.Accessor;

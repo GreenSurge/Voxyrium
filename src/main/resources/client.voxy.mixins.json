@@ -1,6 +1,9 @@
 {
   "required": true,
   "package": "me.cortex.voxy.client.mixin",
+//? if MC_26_3
+  "plugin": "me.cortex.voxy.common.MixinConfig",
+//? endif
   "compatibilityLevel": "JAVA_17",
   "client": [
     "flashback.MixinFlashbackMeta",
@@ -22,6 +25,9 @@
     "minecraft.MixinLevelExtractor",
     "minecraft.MixinLevelRenderer",
     "minecraft.MixinRenderSystem",
+//? if MC_26_3
+    "minecraft.MixinTerrainRenderPasses",
+//? endif
     "minecraft.session.MixinClientPacketListener",
     "minecraft.session.MixinMinecraft",
     "minecraft.util.MixinBlockableEventLoop",
@@ -37,9 +43,14 @@
     "sodium.MixinRenderRegionManager",
     "sodium.MixinRenderSectionManager",
     "sodium.MixinSodiumWorldRenderer",
+//? if MC_26_3
+    "sodium.MixinTerrainRenderContext",
+//? endif
     "sodium.MixinVisibleChunkCollector",
     "vk.AccessorVulkanCommandEncoder",
+//? if MC_26_2
     "vk.MixinSodiumOpaqueVkFrame",
+//? endif
     "vk.MixinVulkanDevice"
   ],
   "injectors": {

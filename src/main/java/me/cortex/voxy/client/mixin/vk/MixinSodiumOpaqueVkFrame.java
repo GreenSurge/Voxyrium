@@ -1,3 +1,4 @@
+//? if MC_26_2
 package me.cortex.voxy.client.mixin.vk;
 
 import com.mojang.blaze3d.textures.GpuSampler;
@@ -44,3 +45,4 @@ public class MixinSodiumOpaqueVkFrame {
         }
     }
 }
+//? endif

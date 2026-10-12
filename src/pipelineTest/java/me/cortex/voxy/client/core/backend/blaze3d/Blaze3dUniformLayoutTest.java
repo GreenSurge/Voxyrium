@@ -1,6 +1,10 @@
 package me.cortex.voxy.client.core.backend.blaze3d;
 
+//? if MC_26_3
+import net.minecraft.client.renderer.DynamicGpuData;
+//? else
 import net.minecraft.client.renderer.DynamicUniforms;
+//? endif
 import org.joml.Matrix4f;
 import org.joml.Vector3f;
 import org.joml.Vector4f;
@@ -20,7 +24,11 @@ public final class Blaze3dUniformLayoutTest {
         var color = new Vector4f(71, 72, 73, 74);
         var offset = new Vector3f(91, 92, 93);
         var bytes = ByteBuffer.allocateDirect(160).order(ByteOrder.nativeOrder());
+//? if MC_26_3
+        new DynamicGpuData.Transform(model, color, offset, texture).write(bytes);
+//? else
         new DynamicUniforms.Transform(model, color, offset, texture).write(bytes);
+//? endif
         var expected = Map.of("ModelViewMat", model.get(new float[16]),
                 "TextureMat", texture.get(new float[16]),
                 "ColorModulator", new float[]{71, 72, 73, 74}, "ModelOffset", new float[]{91, 92, 93});
