@@ -14,14 +14,22 @@ import net.minecraft.client.Minecraft;
 public final class VoxyTerrainRendering {
     private static ChunkRenderMatrices matrices;
     private static CameraTransform camera;
+    private static boolean opaqueRendered;
 
     public static void capture(ChunkRenderMatrices matrices, double x, double y, double z) {
         VoxyTerrainRendering.matrices = matrices;
         camera = new CameraTransform(x, y, z);
+        opaqueRendered = false;
+    }
+
+    public static boolean needsSeparateTerrainPass() {
+        return matrices != null && !IrisUtil.irisShadowActive()
+                && (VoxyGraphicsBackend.usesBlaze3dRenderer() || VoxyGraphicsBackend.usesNativeVulkanRenderer());
     }
 
     public static void renderOpaque() {
-        if (matrices == null || IrisUtil.irisShadowActive()) return;
+        if (matrices == null || opaqueRendered || IrisUtil.irisShadowActive()) return;
+        opaqueRendered = true;
         var gameRenderer = Minecraft.getInstance().gameRenderer;
         var target = gameRenderer.mainRenderTarget();
         if (VoxyGraphicsBackend.usesBlaze3dRenderer()) {
@@ -46,6 +54,7 @@ public final class VoxyTerrainRendering {
         } finally {
             matrices = null;
             camera = null;
+            opaqueRendered = false;
         }
     }
 
