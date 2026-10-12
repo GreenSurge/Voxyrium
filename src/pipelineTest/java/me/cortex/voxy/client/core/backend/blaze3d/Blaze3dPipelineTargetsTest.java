@@ -21,7 +21,8 @@ import java.util.Set;
 /** Exercises Minecraft's actual attachment validation without opening a device or the game. */
 public final class Blaze3dPipelineTargetsTest {
     private static int accepted;
-    public static void main(String[] args) {
+    public static void main(String[] args) throws Exception {
+        Blaze3dUniformLayoutTest.verify();
         verify(Blaze3dAuxiliaryPipelines.SODIUM_DEPTH, GpuFormat.RGBA8_UNORM);
         var variants = Blaze3dAuxiliaryPipelines.SODIUM_DEPTH_VARIANTS;
         verify(variants.sampleMask(), GpuFormat.RGBA8_UNORM);
